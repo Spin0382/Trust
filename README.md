@@ -65,8 +65,8 @@ rotation. A crash partway through a write cannot destroy the previous save. The 
 preserved byte for byte and patched, so everything the header holds that this server does not model
 survives untouched. The sections that carry live state (Journey research, pylon rooms, tile
 entities) are re-encoded from the running server rather than copied, which is what keeps a pylon
-placed this session from vanishing. The bestiary is the exception and it is a real loss: see the
-World files table below.
+placed this session from vanishing. The bestiary is preserved as it arrived, but not updated: this
+server keeps no kill, sighting or chat tracker yet. See the World files table below.
 
 The short version: point it at a `.wld` you already have and it serves it well, with the same
 clients, the same file, and a much lighter footprint than the official server. Point it at nothing
@@ -218,7 +218,7 @@ against these notes. [`AUDIT.md`](AUDIT.md) has the findings behind it, and
 | ✅ | Handshake, world data, section streaming | Checked against a real `TerrariaServer`, not only against our own client |
 | ✅ | Server password | |
 | ✅ | Localized announcements | Keys with substitutions, as the game sends, so a non-English client reads its own language |
-| 🟡 | Packet coverage | 111 of 163 message ids handled. Most of the rest are outbound-only or dead in vanilla too. Genuinely missing, per `tools/packet_audit.py`'s own count: portal-gunning an NPC (100), shop overrides (104), and the dead-player fade cue (135). Spectating (150) is host migration and does not apply to a dedicated server |
+| 🟡 | Packet coverage | 111 of 163 message ids handled. Most of the rest are outbound-only or dead in vanilla too. Genuinely missing, per `tools/packet_audit.py`'s own count: portal-gunning an NPC (100) and shop overrides (104). Spectating (150) is host migration and does not apply to a dedicated server |
 | ⬜ | Steam P2P and lobbies | Steamworks' licence is incompatible with AGPL |
 | ⬜ | Encryption | Terraria's protocol has none. `/login` sends a password as ordinary chat text, so do not reuse a real one |
 
@@ -235,7 +235,7 @@ against these notes. [`AUDIT.md`](AUDIT.md) has the findings behind it, and
 | ✅ | Held pressure plates | Written empty, which is the correct minimum rather than a gap: vanilla's own loader throws the pressed set away on every load too (`wld_save.rs:538-550`) |
 | ✅ | Verified before replacing, fsynced, 3 rotating backups | So a crash mid-write cannot leave a corrupt file in place of a good one |
 | ✅ | `--new <name>` | Generates a fresh world into the world directory, under vanilla's own space-to-underscore filename convention. Refuses rather than overwrites if that name is taken |
-| 🔴 | Bestiary | **Not preserved.** This server keeps no kill/sighting/chat tracker, so the section is written empty on every save and a world opened here loses the bestiary progress it arrived with. Deliberate and reasoned at `wld_save.rs:576-584` (carrying the bytes forward would claim progress the server cannot keep in step with), but a player will notice |
+| 🟡 | Bestiary | **Preserved, not updated.** A loaded world's section is carried through byte for byte, so the progress it arrived with survives every save and reload. This server keeps no live kill/sighting/chat tracker, so kills and sightings made while it runs are not added. Full tracking is a follow-up |
 | ✅ | In-progress blood moon or eclipse | Read on load and patched back on save, so an event survives a restart (`wld.rs:1028-1033`) |
 
 </details>

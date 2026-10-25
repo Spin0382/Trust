@@ -119,14 +119,15 @@ pub fn serialize(world: &World) -> Result<Vec<u8>> {
     pointers[3] = section_pointer(w.len())?;
     write_signs(&mut w, world);
 
-    // --- sections 4..: rewritten from live state, except a section a load did not fully -----
-    //     understand and the footer riding on the tail of the last one
+    // --- sections 4..: rewritten from live state, except the bestiary, a section a load did --
+    //     not fully understand, and the footer riding on the tail of the last one
     //
-    // Sections 5 (tile entities), 6 (pressure plates), 7 (the town manager's room list), 8 (the
-    // bestiary) and 9 (Journey powers) are all written from the server's own state rather than
-    // copied. It has to be: a pylon placed while the server was running is not in the bytes that
-    // were loaded, and one that was mined still is. Copying any of them back would mean the world
-    // remembered whatever it had when it was opened and nothing since.
+    // Sections 5 (tile entities), 6 (pressure plates), 7 (the town manager's room list) and 9
+    // (Journey powers) are written from the server's own state rather than copied. It has to be: a
+    // pylon placed while the server was running is not in the bytes that were loaded, and one that
+    // was mined still is. The bestiary is the exception: this server has no live kill, sighting or
+    // chat tracker to rebuild it from, so its loaded bytes are carried through unchanged. That
+    // keeps progress a world arrived with; it does not record anything that happened this session.
     //
     // Because these sections can change length, the pointers cannot be a single shift any more —
     // each is taken from where its section actually lands.
@@ -148,6 +149,9 @@ pub fn serialize(world: &World) -> Result<Vec<u8>> {
             // simply loses nothing it was ever going to carry forward anyway.
             PRESSURE_PLATE_SECTION => write_pressure_plates(&mut w),
             TOWN_MANAGER_SECTION => write_town_rooms(&mut w, world),
+            // Preserve a real section byte for byte. A section shorter than the three counts
+            // cannot be one, and the empty shape is safer than passing a truncated read on.
+            BESTIARY_SECTION if section.len() >= 12 => w.bytes(section),
             BESTIARY_SECTION => write_bestiary(&mut w),
             JOURNEY_SECTION => write_journey_powers(&mut w, world),
             _ => {
@@ -574,14 +578,12 @@ fn write_town_rooms(w: &mut Writer, world: &World) {
 /// `BestiaryUnlocksTracker.cs:13-18`), each its own `count` then `count` persistent-id entries
 /// (`NPCKillsTracker.cs:60-71`, `NPCWasNearPlayerTracker.cs:65-75`, `NPCWasChatWithTracker.cs`).
 ///
-/// This server keeps no live equivalent of any of the three yet: no per-NPC persistent-id table,
-/// and nothing wired to a kill or a sighting (the client's banner-kill counter this project does
-/// track, `note_banner_kill`, is a different, separate vanilla system - `NetBannersModule`, not
-/// `NetBestiaryModule` - and does not cover every NPC a banner does not exist for). Carrying the
-/// imported bytes forward would claim progress the running server has no memory of and cannot
-/// keep in step with what sections 4/5 say happened this session, so the genuinely empty shape -
-/// three zero counts, exactly what a fresh world's own tracker looks like - is written instead.
-/// Live kill/sighting/chat tracking is a follow-up.
+/// A loaded world's section is carried through byte for byte by `serialize` instead of being
+/// rebuilt here, because this server still has no live per-NPC persistent-id tracker. That keeps
+/// the progress a world arrived with; it deliberately does not add the kills, sightings or
+/// conversations that happened while this server ran. This function is only the genuinely empty
+/// shape a fresh world starts with (three zero counts), which is also the safe fallback for a
+/// section too short to hold them. Live tracking is a follow-up.
 fn write_bestiary(w: &mut Writer) {
     w.i32(0).i32(0).i32(0);
 }
@@ -1789,21 +1791,42 @@ mod tests {
         assert_eq!(section.len(), 16, "no trailing stale entry");
     }
 
-    /// L3-22: the bestiary is always written as the genuinely empty shape (three zero counts),
-    /// never as whatever the loaded section's own bytes said, since this server keeps no live
-    /// kill/sighting/chat tracker to have derived a non-empty one from.
+    /// L3-22, corrected: a loaded bestiary is carried through byte for byte. This server still
+    /// has no live kill/sighting/chat tracker, so it deliberately does not add this session's
+    /// progress, but it must not erase progress the world arrived with.
     #[test]
-    fn the_bestiary_always_saves_empty_even_when_the_loaded_section_held_something() {
+    fn the_bestiary_section_round_trips_preserved_bytes() {
         let mut world = preserved_world();
         let mut claimed = Writer::new();
         claimed.i32(1).string("Zombie").i32(42);
-        claimed.i32(0);
-        claimed.i32(0);
+        claimed.i32(1).string("Zombie");
+        claimed.i32(1).string("Guide");
+        let claimed = claimed.into_bytes();
         world
             .preserved
             .as_mut()
             .expect("a loaded world")
-            .trailing_sections[BESTIARY_SECTION] = claimed.into_bytes();
+            .trailing_sections[BESTIARY_SECTION] = claimed.clone();
+
+        let bytes = serialize(&world).expect("serialize");
+        let back = super::super::wld::parse(&bytes).expect("parse");
+
+        assert_eq!(
+            back.preserved.expect("loaded").trailing_sections[BESTIARY_SECTION],
+            claimed,
+            "the loaded kills, sightings and conversations must survive unchanged"
+        );
+    }
+
+    /// A fresh world has no imported bestiary, so it still starts with the format's genuine empty
+    /// shape: three zero counts for kills, sightings and conversations.
+    #[test]
+    fn a_fresh_world_still_writes_the_empty_bestiary_shape() {
+        let world = crate::world::worldgen::generate(400, 300, "fresh-bestiary", 1);
+        assert!(
+            world.preserved.is_none(),
+            "a generated world has nothing loaded"
+        );
 
         let bytes = serialize(&world).expect("serialize");
         let back = super::super::wld::parse(&bytes).expect("parse");
@@ -1812,6 +1835,27 @@ mod tests {
             back.preserved.expect("loaded").trailing_sections[BESTIARY_SECTION],
             [0i32.to_le_bytes(), 0i32.to_le_bytes(), 0i32.to_le_bytes()].concat(),
             "three empty counts: kills, sightings, conversations"
+        );
+    }
+
+    /// A truncated section cannot be a real bestiary, so the safe fallback is the empty shape
+    /// rather than passing bytes no client can read on to the next save.
+    #[test]
+    fn a_truncated_bestiary_section_falls_back_to_the_empty_shape() {
+        let mut world = preserved_world();
+        world
+            .preserved
+            .as_mut()
+            .expect("a loaded world")
+            .trailing_sections[BESTIARY_SECTION] = vec![1, 2, 3];
+
+        let bytes = serialize(&world).expect("serialize");
+        let back = super::super::wld::parse(&bytes).expect("parse");
+
+        assert_eq!(
+            back.preserved.expect("loaded").trailing_sections[BESTIARY_SECTION],
+            [0i32.to_le_bytes(), 0i32.to_le_bytes(), 0i32.to_le_bytes()].concat(),
+            "a truncated section is replaced with the empty shape"
         );
     }
 

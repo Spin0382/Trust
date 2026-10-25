@@ -1099,6 +1099,12 @@ impl GameServer {
             }
             .encode()?,
         );
+        // `SyncOnePlayer` sends 135 when `statLife <= 0` (`NetMessage.cs:2933-2936`), so a
+        // joining or resyncing observer sees an already-dead peer's fade rather than a living
+        // player at zero health.
+        if player.life <= 0 {
+            frames.push(packets::dead_player(slot)?);
+        }
         frames.push(
             PlayerMana {
                 player: slot,
@@ -2289,18 +2295,28 @@ impl GameServer {
                 // A pickaxe swing that only damages a block also arrives here; only a real break
                 // clears the tile.
                 if edit.destroyed() {
-                    if tile.is_active() && matches!(edit.kind(), TileAction::KillTile) {
-                        // The frames go with the block. Everything that decides what a broken
-                        // object is worth — which evil an orb belongs to, which chair a chair is
-                        // — lives in the frame, and the frame is about to be cleared.
-                        broke = Some((tile.block, tile.frame_x, tile.frame_y));
+                    let drops_item = matches!(edit.kind(), TileAction::KillTile);
+                    // A boulder is one framed 2x2 object, so mining any one of its cells has to
+                    // clear all four and drop exactly one item. `mine_framed_boulder` verifies the
+                    // whole footprint first; an unframed legacy boulder (or a half-cleared one)
+                    // returns false and falls through to the ordinary single-cell path below.
+                    if section_owned && self.mine_framed_boulder(slot, x, y, tile, drops_item) {
+                        // Every cell, the tile log and the drop have already been handled.
+                        changed = false;
+                    } else {
+                        if tile.is_active() && drops_item {
+                            // The frames go with the block. Everything that decides what a broken
+                            // object is worth (which evil an orb belongs to, which chair a chair
+                            // is) lives in the frame, and the frame is about to be cleared.
+                            broke = Some((tile.block, tile.frame_x, tile.frame_y));
+                        }
+                        tile.flags.set(TileFlags::ACTIVE, false);
+                        tile.block = 0;
+                        tile.frame_x = -1;
+                        tile.frame_y = -1;
+                        tile.slope = 0;
+                        tile.flags.set(TileFlags::HALF_BRICK, false);
                     }
-                    tile.flags.set(TileFlags::ACTIVE, false);
-                    tile.block = 0;
-                    tile.frame_x = -1;
-                    tile.frame_y = -1;
-                    tile.slope = 0;
-                    tile.flags.set(TileFlags::HALF_BRICK, false);
                 } else {
                     changed = false;
                 }
@@ -5605,6 +5621,52 @@ fn is_chest_tile_locked(tile: Tile) -> bool {
     false
 }
 
+/// A joining observer has to be told when a peer is already dead. Vanilla's `SyncOnePlayer` sends
+/// packet 135 for exactly that (`NetMessage.cs:2933-2936`), and without it the newcomer sees the
+/// peer standing at zero health until something else makes them fade.
+#[cfg(test)]
+mod presence_frames_dead_players {
+    use super::*;
+    use crate::config::Config;
+
+    fn with_player(life: i16) -> (GameServer, mpsc::Receiver<Bytes>) {
+        let mut server = GameServer::new(
+            Config::default(),
+            crate::world::World::empty(200, 150, "presence dead player probe"),
+        );
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().unwrap(), out_tx);
+        player.life = life;
+        player.state = ConnState::Playing;
+        server.players[0] = Some(player);
+        (server, out_rx)
+    }
+
+    #[test]
+    fn presence_frames_carry_dead_player_for_a_dead_slot() {
+        let (server, _out) = with_player(0);
+        let frames = server.presence_frames(0).expect("presence frames");
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.get(2).copied() == Some(id::DEAD_PLAYER)),
+            "a dead slot must carry packet 135 so a joining observer sees the fade"
+        );
+    }
+
+    #[test]
+    fn a_living_slot_is_not_announced_as_dead() {
+        let (server, _out) = with_player(100);
+        let frames = server.presence_frames(0).expect("presence frames");
+        assert!(
+            frames
+                .iter()
+                .all(|frame| frame.get(2).copied() != Some(id::DEAD_PLAYER)),
+            "a living slot must not be announced as dead"
+        );
+    }
+}
+
 /// A join's own tile stream is spread across ticks (`drain_section_streams`) rather than sent in
 /// one synchronous loop inside `on_spawn_tile_data`'s own packet handler — see
 /// `SECTION_STREAM_BUDGET`'s own doc comment for the measured cost this bounds.
@@ -8171,6 +8233,106 @@ mod player_luck {
         assert!(
             cursed < unlucky,
             "a cursed server rains money less often: {cursed} against {unlucky}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod boulder_mining {
+    use super::*;
+    use crate::config::Config;
+
+    const BOULDER: u16 = 138;
+
+    /// A world with one framed 2x2 boulder anchored at `(100, 100)`, standing on a stone floor,
+    /// every cell lined with a wall so the clear can be checked for preserving it. Returns the
+    /// server, the outbound receiver that must stay alive while the server runs, and the four
+    /// cells top-left first.
+    fn server_with_boulder() -> (GameServer, mpsc::Receiver<Bytes>, [(i32, i32); 4]) {
+        let mut world = crate::world::World::empty(220, 160, "boulder mining probe");
+        for x in 80..140 {
+            world.set_tile(x, 101, Tile::block(1));
+        }
+        let cells = [(100, 99), (101, 99), (100, 100), (101, 100)];
+        for (x, y) in cells {
+            let mut t = world.tile(x, y);
+            t.wall = 5;
+            t.wall_color = 2;
+            world.set_tile(x, y, t);
+        }
+        assert!(
+            crate::world::worldgen::place_object::place_object(
+                &mut world, 100, 100, BOULDER, 0, -1,
+            ),
+            "the test boulder should place on the floor"
+        );
+
+        let mut server = GameServer::new(Config::default(), world);
+        let (tx, rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().expect("test address"), tx);
+        player.state = ConnState::Playing;
+        player
+            .sent_sections
+            .insert(server.world.section_of(100, 99));
+        server.players[0] = Some(player);
+        (server, rx, cells)
+    }
+
+    /// Send one packet-17 kill for `(x, y)`.
+    fn mine(server: &mut GameServer, x: i32, y: i32) {
+        let edit = TileManipulation {
+            action: 0,
+            x: x as i16,
+            y: y as i16,
+            arg: 0,
+            style: 0,
+        };
+        let frame = edit.encode().expect("encode a tile edit");
+        server
+            .on_tile_manipulation(0, &frame[3..])
+            .expect("the kill should be accepted");
+    }
+
+    /// A boulder is one framed object, so whichever of its four cells a player hits, the whole
+    /// 2x2 has to go. Leaving three cells behind is the visible bug this guards against.
+    #[test]
+    fn mining_any_boulder_cell_clears_the_whole_2x2() {
+        for (hit_x, hit_y) in [(100, 99), (101, 99), (100, 100), (101, 100)] {
+            let (mut server, _rx, cells) = server_with_boulder();
+            mine(&mut server, hit_x, hit_y);
+            for (x, y) in cells {
+                let t = server.world.tile(x, y);
+                assert!(
+                    !t.is_active(),
+                    "mining ({hit_x},{hit_y}) left cell ({x},{y}) standing"
+                );
+                assert_eq!(t.wall, 5, "the clear must preserve the wall at ({x},{y})");
+                assert_eq!(t.wall_color, 2, "and its wall colour at ({x},{y})");
+            }
+        }
+    }
+
+    /// Clearing four cells must still yield exactly one boulder, not one item per cell.
+    #[test]
+    fn mining_a_boulder_drops_exactly_one_item() {
+        let (mut server, _rx, cells) = server_with_boulder();
+        mine(&mut server, 101, 100); // the bottom-right cell, not the anchor
+        for (x, y) in cells {
+            assert!(
+                !server.world.tile(x, y).is_active(),
+                "the whole boulder must be gone before the drop is counted"
+            );
+        }
+        assert_eq!(
+            server.items.len(),
+            1,
+            "one boulder must drop exactly one item, however many cells were cleared"
+        );
+        let (_, item) = server.items.iter().next().expect("the drop");
+        assert_eq!(
+            Some(item.item.id),
+            terrustia_proto::placed_items::placed_item(BOULDER, 0),
+            "the item must be the one a boulder of this style is worth"
         );
     }
 }

@@ -651,6 +651,161 @@ async fn the_admin_feature_set_works_over_real_sockets() {
     assert_eq!(status, 404);
 }
 
+/// Starts a real game task and panel on an ephemeral loopback port, claims the server, and returns
+/// the panel's base URL plus a signed-in owner session. The panel task is detached on purpose (the
+/// test runtime ends it), the same lifetime the other in-process panel tests give theirs.
+async fn claimed_panel(motd: &str) -> (String, String) {
+    let panel_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let panel_addr = panel_probe.local_addr().unwrap();
+    drop(panel_probe);
+
+    let config = Config {
+        world_width: 800,
+        world_height: 600,
+        motd: motd.into(),
+        panel_enabled: true,
+        panel_listen: panel_addr,
+        ..Config::default()
+    };
+    let world = worldgen::generate(
+        config.world_width,
+        config.world_height,
+        config.world_name.clone(),
+        17,
+    );
+    let (tx, rx) = mpsc::channel::<ServerEvent>(1024);
+    tokio::spawn(GameServer::new(config.clone(), world).run(rx));
+    let panel_handle = panel::run(config, tx.clone())
+        .await
+        .expect("panel should bind its configured loopback address");
+    drop(panel_handle);
+
+    let (reply, token_rx) = oneshot::channel();
+    tx.send(ServerEvent::PanelAuthLookup {
+        name: String::new(),
+        reply,
+    })
+    .await
+    .unwrap();
+    let token = token_rx
+        .await
+        .unwrap()
+        .claim_token
+        .expect("a fresh server announces a claim token");
+
+    let base = format!("http://{panel_addr}");
+    let client = reqwest_lite::Client::new();
+    let (status, body) = client
+        .post_json(
+            &format!("{base}/api/login"),
+            &format!(
+                r#"{{"name":"owner","password":"correcthorsebatterystaple","claim_token":"{token}"}}"#
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "claiming the server: {body}");
+    (base, extract_session(&body))
+}
+
+/// The settings view's one live-editable field: a valid MOTD reaches the game task through the
+/// existing `PanelSetMotd` event and is read back in the next snapshot.
+#[tokio::test]
+async fn a_valid_motd_applies_live_through_the_game_task() {
+    let (base, session) = claimed_panel("before the change").await;
+    let client = reqwest_lite::Client::new();
+
+    let (status, body) = client
+        .get_status(&format!("{base}/api/config"), Some(&session))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"motd\":\"before the change\""), "{body}");
+    assert!(body.contains("\"max_players\":8"), "{body}");
+    assert!(body.contains("\"password_set\":false"), "{body}");
+
+    let (status, body) = client
+        .post_json_auth(
+            &format!("{base}/api/config/motd"),
+            r#"{"motd":"Welcome, travellers."}"#,
+            &session,
+        )
+        .await;
+    assert_eq!(status, 200, "a valid MOTD should be accepted: {body}");
+
+    let (status, body) = client
+        .get_status(&format!("{base}/api/config"), Some(&session))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"motd\":\"Welcome, travellers.\""),
+        "the MOTD must change live: {body}"
+    );
+}
+
+/// Invalid live settings are refused before the game task sees them, and the fields this build keeps
+/// read-only have no route at all: an attempted change answers `404`, not `200 OK` with the SPA
+/// shell, and leaves the snapshot exactly as it was.
+#[tokio::test]
+async fn invalid_and_unsafe_settings_are_refused_without_changing_the_config() {
+    let (base, session) = claimed_panel("keep me").await;
+    let client = reqwest_lite::Client::new();
+
+    let too_long = "x".repeat(501);
+    let (status, body) = client
+        .post_json_auth(
+            &format!("{base}/api/config/motd"),
+            &format!(r#"{{"motd":"{too_long}"}}"#),
+            &session,
+        )
+        .await;
+    assert_eq!(status, 400, "an overlong MOTD must be refused: {body}");
+    assert!(
+        body.contains("500"),
+        "the refusal should name the character limit: {body}"
+    );
+
+    let (status, body) = client
+        .post_json_auth(
+            &format!("{base}/api/config/motd"),
+            r#"{"motd":"first line\nsecond line"}"#,
+            &session,
+        )
+        .await;
+    assert_eq!(status, 400, "a multi-line MOTD must be refused: {body}");
+    assert!(
+        body.contains("single line"),
+        "the refusal should say why: {body}"
+    );
+
+    // `max_players`, the join password and the listen address are read-only in this build. A guessed
+    // route must not answer with the SPA shell's success status and must not mutate anything.
+    for path in [
+        "/api/config/max-players",
+        "/api/config/password",
+        "/api/config/listen",
+    ] {
+        let (status, body) = client
+            .post_json_auth(&format!("{base}{path}"), r#"{"value":1}"#, &session)
+            .await;
+        assert_eq!(
+            status, 404,
+            "{path} must not be a live settings route: {body}"
+        );
+    }
+
+    let (status, body) = client
+        .get_status(&format!("{base}/api/config"), Some(&session))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("\"motd\":\"keep me\""),
+        "a refused value must not reach the game task: {body}"
+    );
+    assert!(
+        body.contains("\"max_players\":8") && body.contains("\"password_set\":false"),
+        "the read-only fields must be untouched: {body}"
+    );
+}
+
 /// The four features added while finishing the panel — a live metrics snapshot, the backup/rollback
 /// view and its guards, the groups/accounts admin (including the lock-out guard that stops the last
 /// admin account being stripped), and world-creation validation — over real sockets, in one flow.

@@ -18,8 +18,10 @@ WorkingDirectory=/var/lib/terrustia
 ExecStart=/usr/local/bin/terrustia --config /etc/terrustia/terrustia.toml
 
 # The server exits non-zero when it crashes and zero when it is asked to stop, so this restarts
-# after a fault and stays down after `systemctl stop`. That distinction only started working when
-# the panic path was fixed — before it, a crashed server exited 0 and was never restarted.
+# after a fault and stays down after `systemctl stop`. A rollback is the deliberate exception: it
+# exits 75 so the restored world is loaded by a fresh process, because the running one has already
+# dropped its save path. The crash distinction only started working when the panic path was fixed;
+# before it, a crashed server exited 0 and was never restarted.
 Restart=on-failure
 RestartSec=5s
 

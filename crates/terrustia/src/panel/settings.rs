@@ -1,4 +1,5 @@
-//! Read-only config, the motd, console/chat send, live metrics, and backups/rollback.
+//! The config snapshot, the one live-safe setting (the motd), console/chat send, live metrics, and
+//! backups/rollback.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -77,6 +78,32 @@ async fn config_snapshot(
     }
 }
 
+/// The stock chat-line ceiling (`Config::max_chat_len`'s default). The MOTD is broadcast as one
+/// literal chat line, so a longer value is refused rather than truncated: silently sending a
+/// shortened message would leave the operator believing the text they typed went out.
+const MAX_MOTD_CHARS: usize = 500;
+
+/// The MOTD reaches every client as literal chat text (`on_player_spawn`'s `chat_broadcast`). A
+/// newline or other control character would render as a blank line or an unprintable glyph in
+/// everyone's chat, so it is refused instead of being rewritten.
+fn validate_motd(motd: &str) -> Result<(), String> {
+    let chars = motd.chars().count();
+    if chars > MAX_MOTD_CHARS {
+        return Err(format!(
+            "the message of the day is limited to {MAX_MOTD_CHARS} characters; this one is {chars}"
+        ));
+    }
+    if motd
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(
+            "the message of the day must be a single line without control characters".into(),
+        );
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct MotdRequest {
     motd: String,
@@ -89,6 +116,9 @@ async fn set_motd(
 ) -> Response {
     if let Err(resp) = authorized(&state, &headers, perm::WORLD_MOTD).await {
         return resp;
+    }
+    if let Err(message) = validate_motd(&req.motd) {
+        return err(StatusCode::BAD_REQUEST, message);
     }
     match ask(&state, |reply| ServerEvent::PanelSetMotd {
         motd: req.motd,
@@ -370,5 +400,47 @@ async fn rollback(
         Ok(Ok(message)) => Json(RollbackResponse { message }).into_response(),
         Ok(Err(e)) => err(StatusCode::BAD_REQUEST, e),
         Err(resp) => resp,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_MOTD_CHARS, validate_motd};
+
+    /// The empty string is not an error: it is how an operator disables the greeting, exactly as an
+    /// empty `motd` in the config does.
+    #[test]
+    fn a_line_at_the_ceiling_and_the_empty_disable_are_accepted() {
+        assert!(validate_motd("").is_ok());
+        assert!(validate_motd("Welcome, travellers.").is_ok());
+        assert!(validate_motd(&"x".repeat(MAX_MOTD_CHARS)).is_ok());
+    }
+
+    #[test]
+    fn an_overlong_motd_is_refused_with_the_limit_in_the_message() {
+        let message = validate_motd(&"x".repeat(MAX_MOTD_CHARS + 1))
+            .expect_err("a message past the ceiling must be refused");
+        let limit = MAX_MOTD_CHARS.to_string();
+        assert!(
+            message.contains(limit.as_str()),
+            "the refusal should name the limit: {message}"
+        );
+    }
+
+    /// A newline would turn one MOTD into two chat lines, and other control characters have no
+    /// printable rendering in a Terraria chat message at all.
+    #[test]
+    fn newlines_and_other_control_characters_are_refused() {
+        for motd in [
+            "first line\nsecond line",
+            "carriage\rreturn",
+            "bell\u{7}",
+            "line\u{2028}separator",
+        ] {
+            assert!(
+                validate_motd(motd).is_err(),
+                "{motd:?} must not be accepted as one chat line"
+            );
+        }
     }
 }

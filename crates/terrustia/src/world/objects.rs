@@ -92,11 +92,13 @@ pub struct SavedNpc {
 
 /// Byte ranges of a loaded save that this server does not model.
 ///
-/// Saving re-serialises the header prefix, tiles, chests and signs, and now also rewrites the
-/// townsfolk (with the pillars' own second list), the tile entities, the pressure-plate section,
-/// the town manager's room list, the bestiary and the Journey powers from live state. Only a
-/// section a load did not fully understand, or one this server genuinely keeps no state for,
-/// still passes through as the bytes it arrived as.
+/// Saving re-serialises the header prefix, tiles, chests and signs, and rewrites the townsfolk
+/// (with the pillars' own second list), the tile entities, the pressure-plate section, the town
+/// manager's room list and the Journey powers from live state. The bestiary is carried through
+/// unchanged instead: this server keeps no live kill/sighting/chat tracker to rebuild it from, and
+/// preserving the loaded bytes is better than erasing progress. A section a load did not fully
+/// understand, or one this server genuinely keeps no state for, also passes through as the bytes
+/// it arrived as.
 #[derive(Debug, Clone, Default)]
 pub struct PreservedWorld {
     /// Format version of the file this came from.

@@ -18,6 +18,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use terrustia::config::Config;
+
 /// Reads `stdout` on a background thread, forwarding each line to the returned channel. Needed
 /// because a graceful `SIGTERM` only does anything once `main.rs`'s own `stop_signal()` has
 /// actually registered its signal handler — which happens once the server reaches its main
@@ -94,6 +96,20 @@ fn wait_for_file(dir: &Path, name: &str, timeout: Duration) -> Vec<PathBuf> {
     }
 }
 
+/// Poll for the wizard's config file, the same way [`wait_for_file`] polls for the world. A
+/// fixed sleep here would be another load-sensitive window: the prompts are answered as soon as
+/// the pipe accepts them, but the write itself is behind `safe_write`'s temp-file-and-rename.
+fn wait_for_config(path: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
 fn spawn_setup(home: &Path, listen: &str) -> std::process::Child {
     let mut command = Command::new(env!("CARGO_BIN_EXE_terrustia"));
     // Windows has no `kill -TERM`. The only way one process can ask another to stop *gracefully*
@@ -138,20 +154,23 @@ fn the_wizard_writes_a_config_and_generates_the_world_it_named() {
     let stdout_lines = stream_stdout_lines(child.stdout.take().expect("piped stdout"));
     {
         let stdin = child.stdin.as_mut().expect("piped stdin");
-        // In prompt order: dedicated directory, world name, max players, panel enabled.
+        // In prompt order: dedicated directory, world name, max players, panel enabled, then the
+        // five world/server questions. An empty line accepts each shown default, which is what this
+        // test is proving: the wizard's defaults are real, accepted values, not just labels.
         writeln!(stdin, "{}", dedicated_dir.display()).unwrap();
         writeln!(stdin, "CLI Wizard World").unwrap();
         writeln!(stdin, "4").unwrap();
         writeln!(stdin, "n").unwrap();
+        writeln!(stdin).unwrap(); // world size: small
+        writeln!(stdin).unwrap(); // world seed: 0
+        writeln!(stdin).unwrap(); // listen: 0.0.0.0:7777
+        writeln!(stdin).unwrap(); // password: none
+        writeln!(stdin).unwrap(); // autosave: 300 seconds
     }
 
     let config_path = dedicated_dir.join("terrustia.toml");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !config_path.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-    }
     assert!(
-        config_path.exists(),
+        wait_for_config(&config_path, Duration::from_secs(30)),
         "the wizard should have written {} by now",
         config_path.display()
     );
@@ -168,19 +187,45 @@ fn the_wizard_writes_a_config_and_generates_the_world_it_named() {
         written.contains("panel_enabled = false"),
         "expected the chosen panel answer in the written config, got:\n{written}"
     );
+    let defaults = Config::default();
+    for (what, expected) in [
+        (
+            "world width",
+            format!("world_width = {}", defaults.world_width),
+        ),
+        (
+            "world height",
+            format!("world_height = {}", defaults.world_height),
+        ),
+        ("world seed", format!("seed = {}", defaults.seed)),
+        (
+            "listen address",
+            format!("listen = \"{}\"", defaults.listen),
+        ),
+        ("password", format!("password = {:?}", defaults.password)),
+        (
+            "autosave interval",
+            format!("autosave_secs = {}", defaults.autosave_secs),
+        ),
+    ] {
+        assert!(
+            written.contains(&expected),
+            "expected the default {what} ({expected:?}) in the written config, got:\n{written}"
+        );
+    }
 
     // The wizard hands off to an ordinary boot after writing the file. The world it named is not
-    // written to disk until the first autosave or a clean shutdown — the wizard deliberately does
-    // not expose an `autosave_secs` prompt (it stays "basic"), so unlike `new_world_cli.rs`'s own
-    // test (which pre-seeds a fast `autosave_secs = 1`) this one asks for a real, graceful
-    // shutdown instead of waiting out the real default. `child.kill()` sends `SIGKILL` on Unix,
-    // which skips the save path entirely — `SIGTERM`, via the real `kill` binary, is what
-    // `main.rs`'s own `stop_signal()` actually listens for, but only *after* it has registered
-    // that handler inside its main `tokio::select!`: sending it any earlier hits `SIGTERM`'s
-    // default disposition instead (terminate immediately, no save) — this test's own first draft
-    // raced exactly that window with a fixed sleep. `"accepting connections"` is the real,
-    // observed proof the handler is live, the same poll-don't-sleep discipline `wait_for_file`
-    // above already applies to the filesystem side of this.
+    // written to disk until the first autosave or a clean shutdown. The autosave prompt's default
+    // is 300 seconds, so unlike `new_world_cli.rs`'s own test (which pre-seeds a fast
+    // `autosave_secs = 1`) this one asks for a real, graceful shutdown instead of waiting out that
+    // default. `child.kill()` sends `SIGKILL` on Unix, which skips the save path entirely -
+    // `SIGTERM`, via the real `kill` binary, is what `main.rs`'s own `stop_signal()` actually
+    // listens for, but only *after* it has registered that handler inside its main
+    // `tokio::select!`: sending it any earlier hits `SIGTERM`'s default disposition instead
+    // (terminate immediately, no save) - this test's own first draft raced exactly that window with
+    // a fixed sleep. `"accepting connections"` is the real, observed proof the handler is live,
+    // the same poll-don't-sleep discipline `wait_for_file` above already applies to the filesystem
+    // side of this.
     assert!(
         wait_for_line(
             &stdout_lines,
@@ -233,6 +278,78 @@ fn the_wizard_writes_a_config_and_generates_the_world_it_named() {
         !found[0].starts_with(&dedicated_dir),
         "the world must not land inside the dedicated config directory"
     );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The same transcript, but answering every new question explicitly. The world size is given as
+/// the smallest size `Config::validate` accepts (400x300) rather than a preset, so generation stays
+/// quick enough to prove the written config is what the server actually boots from.
+#[test]
+fn the_wizard_writes_every_world_and_server_choice_it_asked_about() {
+    let home = scratch_home("explicit-choices");
+    std::fs::create_dir_all(&home).expect("scratch home");
+    let dedicated_dir = home.join("dedicated-config-dir");
+    let cli_listen = support::free_addr();
+    let config_listen = format!("127.0.0.1:{}", support::free_port());
+
+    let mut child = support::Reaper(spawn_setup(&home, &cli_listen));
+    let stdout_lines = stream_stdout_lines(child.stdout.take().expect("piped stdout"));
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        // In prompt order: dedicated directory, world name, max players, panel enabled, world
+        // size, world seed, listen address, password, autosave interval.
+        writeln!(stdin, "{}", dedicated_dir.display()).unwrap();
+        writeln!(stdin, "Explicit Choices World").unwrap();
+        writeln!(stdin, "6").unwrap();
+        writeln!(stdin, "n").unwrap();
+        writeln!(stdin, "400x300").unwrap();
+        writeln!(stdin, "424242").unwrap();
+        writeln!(stdin, "{config_listen}").unwrap();
+        writeln!(stdin, "s3cret pass").unwrap();
+        writeln!(stdin, "45").unwrap();
+    }
+
+    let config_path = dedicated_dir.join("terrustia.toml");
+    assert!(
+        wait_for_config(&config_path, Duration::from_secs(30)),
+        "the wizard should have written {} by now",
+        config_path.display()
+    );
+    let written = std::fs::read_to_string(&config_path).expect("read the written config");
+    for expected in [
+        "world_name = \"Explicit Choices World\"",
+        "max_players = 6",
+        "panel_enabled = false",
+        "world_width = 400",
+        "world_height = 300",
+        "seed = 424242",
+        "autosave_secs = 45",
+        "password = \"s3cret pass\"",
+    ] {
+        assert!(
+            written.contains(expected),
+            "expected {expected:?} in the written config, got:\n{written}"
+        );
+    }
+    assert!(
+        written.contains(&format!("listen = \"{config_listen}\"")),
+        "expected the answered listen address in the written config, got:\n{written}"
+    );
+
+    // The config is not just text: the server reads it and reaches its main loop. The CLI's
+    // `--listen` still wins over the address written here, which is the existing precedence rule
+    // this change deliberately does not alter.
+    assert!(
+        wait_for_line(
+            &stdout_lines,
+            "accepting connections",
+            Duration::from_secs(30)
+        ),
+        "the server should have booted from the config the wizard wrote"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 
     let _ = std::fs::remove_dir_all(&home);
 }

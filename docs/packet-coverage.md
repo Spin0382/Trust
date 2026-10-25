@@ -35,16 +35,15 @@ python3 tools/packet_audit.py --write-doc
 | Dispatched by handle_packet | 79 |
 | Relayed opaquely (received, not parsed) | 32 |
 | Ignored (falls to the catch-all) | 2 |
-| Sent via a dedicated encoder | 73 |
-| Sent via a generic relay | 38 |
+| Sent via a dedicated encoder | 75 |
+| Sent via a generic relay | 37 |
 
-## Live ids with no terrustia implementation on either side (3)
+## Live ids with no terrustia implementation on either side (2)
 
 Every one of these is a real, currently-used vanilla mechanic (`status = live`) that this server neither receives nor sends. Each is a genuine gap, not a dead id; see its row's evidence column below for what it is and where it comes from.
 
 - **TeleportNPCThroughPortal** (100) - STOPPED (C1-b item 7), investigated in full rather than left as a guess. Real send site: PortalHelper.TryGoingThroughPortals (Terraria.GameContent/PortalHelper.cs:105-214), server-only (if (Main.netMode == 2)) since NPCs are server-authoritative, firing when an NPC's hitbox crosses a placed Portal Gun portal's own collision line (GetPortalEdges from the portal's position and ai[0] angle) and teleporting it to the paired portal's outing point. terrustia tracks a placed portal projectile only as an ordinary projectile (enough for on_close_portal's packet-95 removal case, which already reads its ai[1] "which" colour value) with no pairing into a linked gate (vanilla's own FoundPortals), no per-tick NPC-vs-portal collision pass, no outing-point/velocity math, and no per-portal-per-NPC cooldown -- the whole trigger this packet reports has no server-side model to report at all. A dispatch arm or encoder with nothing real behind it would be the "fake handler" this lane's own instructions explicitly rule out, so recv_impl/send_impl stay none rather than being stubbed. See id::TELEPORT_N_P_C_THROUGH_PORTAL's own doc comment (terrustia-proto/src/id.rs) for the same account.
 - **ShopOverride** (104) - The decompiled-tree audit (tools/packet_audit.py's NetMode==1 client-send heuristic) classifies it server-to-client only. Needs a shop-price-override model terrustia does not have yet: a genuine gap.
-- **DeadPlayer** (135) - deliberately not dispatched (game/server/dispatch.rs:130-133): vanilla's own case 135 is `if (Main.netMode == 1)`, a client-only immuneAlpha fade, so a dedicated server drops an incoming one exactly like vanilla does. Real gap: vanilla's SyncOnePlayer (NetMessage.cs:2933-2936) also sends this server-to-client when statLife<=0 during a player sync, so newly joined/resyncing observers see an already-dead peer's fade cue; this server never sends it, so that one cosmetic cue is missing. Not implemented, disclosed here rather than papered over.
 
 ## Dead slots and deprecated ids (12)
 
@@ -127,7 +126,7 @@ Every one of these is a real, currently-used vanilla mechanic (`status = live`) 
 | 49 | InitialSpawn | server->client | no | yes | live | none | dedicated-encoder |
 | 50 | PlayerBuffs | both | yes | yes | live | dispatched | generic-relay |
 | 51 | MiscDataSync | both | yes | yes | live | dispatched | dedicated-encoder |
-| 52 | LockAndUnlock | both | yes | yes | live | dispatched | generic-relay |
+| 52 | LockAndUnlock | both | yes | yes | live | dispatched | dedicated-encoder |
 | 53 | AddNPCBuff | both | yes | yes | live | dispatched | dedicated-encoder |
 | 54 | NPCBuffs | server->client | no | yes | live | none | dedicated-encoder |
 | 55 | AddPlayerBuffPvP | both | yes | yes | live | dispatched | dedicated-encoder |
@@ -210,7 +209,7 @@ Every one of these is a real, currently-used vanilla mechanic (`status = live`) 
 | 132 | PlayLegacySound | both | yes | yes | live | relayed-opaque | generic-relay |
 | 133 | FoodPlatterTryPlacing | client->server | yes | no | live | dispatched | none |
 | 134 | UpdatePlayerLuckFactors | both | yes | yes | live | relayed-opaque | generic-relay |
-| 135 | DeadPlayer | both | yes | yes | live | ignored | none |
+| 135 | DeadPlayer | both | yes | yes | live | ignored | dedicated-encoder |
 | 136 | SyncCavernMonsterType | server->client | no | yes | live | none | dedicated-encoder |
 | 137 | RequestNPCBuffRemoval | client->server | yes | no | live | dispatched | none |
 | 138 | ClientSyncedInventory | server->client | no | yes | not-applicable-dedicated | none | none |

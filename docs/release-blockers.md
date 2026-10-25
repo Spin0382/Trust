@@ -39,7 +39,7 @@ citation no longer does.
 |---|---|---|
 | `just check` green (fmt, clippy x2, deny, packet audit, web build, workspace tests) | MET, re-run 2026-09-06 | `All checks passed ✓`, exit 0, 24 test binaries and zero failures. **CI was not green when this was re-run**, and `just check` could not have told anyone: the `packet-audit` job had been failing since `9f056a2` because `docs/packet-ids.tsv` row 51 disagreed with the code, and `just check` did not run that script. It does now (`justfile`'s `check-rust`), so the two cannot diverge again |
 | `just check-data` green (nine parts: drops, npc-data, placed-items, tile-object, recipes, parity, spawn-reach, mutants, dead-writes) | **MET 2026-09-06: all nine run** | This row twice claimed more than it had. It said "all six run 2026-09-04" while naming six of the nine, and three of those nine (`check-npc-data`, `check-placed-items`, `check-tile-object`) did not exist on that date; `check-citations` landed later still and immediately found real defects (`2753a1d`). All nine were run 2026-09-06. `check-parity` green (3,848 citations still pointing at the code they were checked against), `check-drops` green (375 of 378 NPC types, 40 of 40 deferrals on the record), `check-spawn-reach` green (the two known ids in `docs/spawn-gaps.tsv`), `check-npc-data`, `check-placed-items`, `check-tile-object` and `check-recipes` green. `check-mutants` had never been run at all: 600 mutants over six targets, 100% killed, none survived, and the tables restored byte-identical afterwards. `check-dead-writes` was **failing on `main`** when first run that day (`NetVariant::rarity`, dead since `4d27097`); it is green now, with the field excused against a traced reason and the missing consumer recorded in `TODO.md` |
-| Zero unknown protocol IDs | MET, evidence corrected 2026-09-08 | `docs/packet-ids.tsv` has no row whose status is `unknown`, which is what the clause asks. The evidence line here used to add "and no row that is `none`/`none`", and that was false: **19 rows are unimplemented on both sides**, each with a documented status - `dead-slot`, `deprecated`, `modding`, `social-host-only`, `not-applicable-dedicated`, `client-bookkeeping`. Unimplemented-with-a-reason is not the same as unknown, and the clause was always about the latter. Three of the nineteen are `live`: 100 TeleportNPCThroughPortal, 104 ShopOverride, 135 DeadPlayer. `tools/packet_audit.py` names them on every run and nothing gates on them; they are a real gap and are recorded here rather than left inside a sentence that said there were none |
+| Zero unknown protocol IDs | MET, evidence corrected 2026-09-08 | `docs/packet-ids.tsv` has no row whose status is `unknown`, which is what the clause asks. The evidence line here used to add "and no row that is `none`/`none`", and that was false: **19 rows are unimplemented on both sides**, each with a documented status - `dead-slot`, `deprecated`, `modding`, `social-host-only`, `not-applicable-dedicated`, `client-bookkeeping`. Unimplemented-with-a-reason is not the same as unknown, and the clause was always about the latter. Two of the nineteen are `live`: 100 TeleportNPCThroughPortal and 104 ShopOverride; 135 DeadPlayer is now sent from `presence_frames`. `tools/packet_audit.py` names the remaining two on every run and nothing gates on them; they are a real gap and are recorded here rather than left inside a sentence that said there were none |
 | Fuzzing green | MET | `fuzz/artifacts/` is empty; both targets run per-push in CI |
 | p99 tick under the 16.67 ms budget at 255 players | MET | `TODO.md`'s soak table, four runs, with a neutralised control run proving the `BiomeCache` cap is what holds it |
 | **Peak RSS under 1 GiB at 255 players** | **MET 2026-09-06** | A full 30-minute hold at 255 players, all 255 held to the end and none shed. Peak 158 MiB against the 1 GiB ceiling, oscillating between 64 and 158 and ending below its start rather than climbing. It took fixing the harness to measure: two earlier runs died at 14:43 and 12:19 because the old one-process-per-player rig needed ~3.5 GB before the server allocated anything. A ceiling result, not a leak-freedom result. See "The memory ceiling" below |
@@ -240,14 +240,16 @@ worst first by what a player or operator would actually notice.
 3. ~~`follows_boss` is broader than vanilla's segment gate.~~ **Fixed 2026-09-05.** The derivation
    has a name now (`shares_a_life_pool`) and answers vanilla's actual question, so Skeletron's hands
    and Golem's fists are drained like the separate NPCs they are.
-4. **Self-update cannot replace the running binary off Unix**
-   (`crates/terrustia/src/update.rs:485-498`, the `#[cfg(windows)] install` arm, which copies to
-   `terrustia.exe.new` and returns `DownloadedForManualApply`). The operator has to finish the
-   update by hand on Windows. This entry used to cite `:58-60`, the enum variant's doc comment,
-   which itself points readers at a `cfg(not(unix))` branch that does not exist anywhere in the
-   file - the branch is `#[cfg(windows)]` on `install`.
-   Separately, and now fixed: Windows ARM64 could not self-update *at all*, because `target_triple`
-   had no arm for a target `release.yml` has been publishing.
+4. ~~Self-update cannot replace the running binary off Unix.~~ **Fixed 2026-10-25.** The Windows
+   `install` arm now stages the verified binary beside the target, starts a detached helper and
+   lets it wait for the server to exit, replace the target with backups and retries, and relaunch
+   with the original arguments and working directory. The helper is Windows-only; its end-to-end
+   test runs on the host-native Windows CI entry, so Linux still cannot exercise the swap itself.
+   The old entry cited `:58-60`, the enum variant's doc comment, which pointed readers at a
+   `cfg(not(unix))` branch that does not exist anywhere in the file; the branch is `#[cfg(windows)]`
+   on `install`.
+   Separately, and already fixed: Windows ARM64 could not self-update *at all*, because
+   `target_triple` had no arm for a target `release.yml` has been publishing.
 5. ~~One bad Journey-power id in a `.wld` silently defaults every power after it.~~ **Addressed
    2026-09-05**, though not by changing what it does: stopping the read is correct, since an id whose
    payload width is unknown cannot be stepped over without misreading everything after it. It now
@@ -355,14 +357,15 @@ once, worst first by what a player saw, rather than folded into the bullets belo
   any live boss`, with a comment saying the countdown "is not modelled as a countdown" - which was
   true when it was written and is not now, since `lunar.countdown` is right there. So for the 3,600
   ticks between the last pillar falling and the Moon Lord arriving, vanilla considers the world
-  dangerous and this server does not, and ambient spawning carries on as if nothing were coming.
-  One clause plus a test; tracked in `TODO.md`.
-- **A hand holds its station** through its attacks rather than being pulled off it by each one
-  (the sphere barrage's `SmoothStep` swing to `400 * side, -60`, for instance). Still true at
-  `moon_lord.rs:301-311`, but the cross-references beside it are not: `moon_lord.rs:452` and `:585`
-  say this is "the same narrowing the deathray already carries" and the deathray stopped carrying
-  it in `9f65f54`, which moved the sweep into `systems::tick_phantasmal_deathrays`. What remains
-  narrowed is the hand station and the hover-then-relaunch gather, not the head and not the ray.
+  dangerous and this server did not, and ambient spawning carried on as if nothing were coming.
+  **Fixed 2026-10-25:** `GameServer::any_danger` now includes `self.lunar.countdown > 0`, with a
+  test, so the 3,600-tick post-pillar window holds ambient spawns off.
+- **A hand holds its station for most attacks.** The sphere barrage's swing out to
+  `400 * side, -60` is now modelled in `hand_target`, so the hand leaves its station for that
+  attack and returns afterwards. The other attack paths still hold station, and the six spheres
+  are still fired as one fan at the launch tick because the projectile layer has no
+  hover-then-relaunch AI. What remains narrowed is those other paths and the gather itself, not
+  the head and not the deathray.
 - ~~Old One's Army has no client-visible progress bar.~~ **Fixed 2026-09-05**: it rides packet 78
   with its own icon 3 and its wave number, as `DD2Event.cs:185`/`:191` do.
 - ~~**Frost and Pumpkin Moon wave-gated drops** are flattened to guaranteed picks rather than gated on

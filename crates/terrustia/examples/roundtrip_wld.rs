@@ -147,8 +147,8 @@ fn main() -> ExitCode {
             match i {
                 0 => report_identical("townsfolk fallback", a, b, &mut problems),
                 1 => report_identical("tile-entity fallback", a, b, &mut problems),
-                // Pressure plates and the bestiary always save as the genuinely empty shape now
-                // (L3-21/L3-22) — a real file's own bytes here are exactly what must NOT survive.
+                // Pressure plates save as the genuinely empty shape (L3-21); a real file's own
+                // bytes here are exactly what must NOT survive.
                 2 => {
                     let empty = 0i32.to_le_bytes();
                     if b.as_slice() == empty {
@@ -163,18 +163,9 @@ fn main() -> ExitCode {
                         problems += 1;
                     }
                 }
-                4 => {
-                    let empty = [0i32.to_le_bytes(); 3].concat();
-                    if *b == empty {
-                        println!("  ok    bestiary: saved empty (no live kill/sight tracker yet)");
-                    } else {
-                        println!(
-                            "  MISMATCH: bestiary did not save empty ({} bytes)",
-                            b.len()
-                        );
-                        problems += 1;
-                    }
-                }
+                // The bestiary is carried through unchanged: there is no live tracker yet, but
+                // imported progress must survive a save rather than be erased.
+                4 => report_identical("bestiary", a, b, &mut problems),
                 // The town manager's room list (L3-20) is derived from the live residents this
                 // same save just wrote into section 4, so it need not match the source file's own
                 // bytes at all — only informational here, not a pass/fail check.

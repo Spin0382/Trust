@@ -134,6 +134,17 @@ pub fn player_active(player: u8, active: bool) -> Result<Vec<u8>> {
     w.finish()
 }
 
+/// Packet `135`: one player is dead (`NetMessage.SyncOnePlayer`, `NetMessage.cs:2933-2936`).
+///
+/// The body is a single player slot. A client uses this to show the death fade for a peer that was
+/// already dead when it joined or resynced; vanilla's own receive case is client-only
+/// (`if (Main.netMode == 1)`), so a dedicated server never handles an incoming one.
+pub fn dead_player(player: u8) -> Result<Vec<u8>> {
+    let mut w = PacketWriter::new(id::DEAD_PLAYER);
+    w.u8(player);
+    w.finish()
+}
+
 /// Packet `16`: current and maximum life.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayerHealth {
@@ -913,6 +924,14 @@ mod tests {
         let frame = player_info(3, false).unwrap();
         assert_eq!(frame, vec![5, 0, id::PLAYER_INFO, 3, 0]);
         assert_eq!(payload(&frame).len(), 2);
+    }
+
+    #[test]
+    fn dead_player_names_one_slot() {
+        // `NetMessage.SyncOnePlayer`'s 135 body is a single byte, the player id.
+        let frame = dead_player(7).unwrap();
+        assert_eq!(frame, vec![3, 0, id::DEAD_PLAYER, 7]);
+        assert_eq!(payload(&frame), &[7u8]);
     }
 
     #[test]

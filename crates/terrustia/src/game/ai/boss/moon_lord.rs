@@ -111,6 +111,20 @@ pub const MOON_LORD_SHOTS: [u16; 5] = [
 /// How far into the death drama the stage is cleared (`NPC.cs:41752`, `ai[1] == 60f`).
 const CLEAR_STAGE_AT: f32 = 60.0;
 
+/// Where a hand swings out to for its sphere barrage: `Center + (400 * side, -60)`, fifty pixels
+/// further out and forty lower than its station (`NPC.cs:42173-42241`).
+const HAND_BARRAGE_OUT: f32 = 400.0;
+const HAND_BARRAGE_UP: f32 = 60.0;
+
+/// The tick of the barrage step at which the six gathered spheres launch together
+/// (`num2 == 292`, `NPC.cs:42184-42260`). Until then the hand holds the barrage point.
+const SPHERE_LAUNCH: f32 = 292.0;
+
+/// Six spheres are gathered one every thirty ticks over the barrage's gather window
+/// (`num12 % 30 == 0`, six times, `NPC.cs:42184-42260`). This layer has no hover-then-relaunch
+/// AI, so they are all fired at [`SPHERE_LAUNCH`] rather than orbited first.
+const SPHERE_COUNT: usize = 6;
+
 /// Style 77: the core.
 ///
 /// `parts_open` is how many of its three eyes have been broken (counting both a socket that has
@@ -297,18 +311,6 @@ pub fn eye_socket(
         npc.velocity = (0.0, 0.0);
         let (w, h) = (npc.width(), npc.height());
         npc.position = (bx - w / 2.0, by - MOON_LORD_HEAD_UP - h / 2.0);
-    } else {
-        // A hand eases toward its own station. Vanilla flies it there with `SimpleFlyMovement`
-        // and lets each attack pull it off station on its own path (the sphere barrage's
-        // `SmoothStep` swing out to `400 * side, -60`, for one); those per-attack paths are not
-        // modelled here, so a hand holds its station throughout, which is the narrowing this
-        // module's projectile-gathering note already carries.
-        //
-        // `ai[2]` is which hand this is.
-        let side = if npc.ai[2] >= 1.0 { 1.0 } else { -1.0 };
-        let station = (bx + side * MOON_LORD_HAND_OUT, by - MOON_LORD_HAND_UP);
-        let (cx, cy) = npc.center();
-        npc.velocity = ((station.0 - cx) * 0.2, (station.1 - cy) * 0.2);
     }
 
     // BS3-M3: the eyelid. Vanilla decides a socket's damageability from the eye's own openness,
@@ -352,11 +354,17 @@ pub fn eye_socket(
         // A broken socket is shut, and vanilla's own `-2` branch says so outright
         // (`NPC.cs:42063`, `NPC.cs:42600`: `damage = 0; dontTakeDamage = true;` with an openness
         // of nought, so the lid falls back open while the socket hangs there harmless).
+        if !head {
+            ease_hand(npc, hand_station(npc, (bx, by)));
+        }
         ease_lid(npc, 0.0, lid_step, lid_shut);
         return out;
     }
 
     let Some(target) = world.target.filter(|t| t.alive) else {
+        if !head {
+            ease_hand(npc, hand_station(npc, (bx, by)));
+        }
         return out;
     };
 
@@ -368,9 +376,50 @@ pub fn eye_socket(
         run_head_attack(npc, &mut out, target.center, attack, within, dur);
     } else {
         run_hand_attack(npc, &mut out, target.center, attack, within, dur);
+        // A hand eases toward whatever its current attack holds it at. Vanilla flies it with
+        // `SimpleFlyMovement` and lets each attack pull it off station on its own path; the sphere
+        // barrage's swing out to `400 * side, -60` is transcribed in `hand_target`, and the other
+        // attacks still hold station, which is the remaining narrowing. The ease itself is the one
+        // this module already used for the station, because the citations pin the barrage's
+        // destination and timings but not its speed or acceleration.
+        ease_hand(npc, hand_target(npc, (bx, by), attack, within));
     }
     ease_lid(npc, openness(head, attack, within, dur), lid_step, lid_shut);
     out
+}
+
+/// A hand's station on the core: `Center + (350 * side, -100)`, with the side from `ai[2]`
+/// (`NPC.cs:42073`, `:42094`).
+fn hand_station(npc: &Npc, centre: (f32, f32)) -> (f32, f32) {
+    let side = if npc.ai[2] >= 1.0 { 1.0 } else { -1.0 };
+    (
+        centre.0 + side * MOON_LORD_HAND_OUT,
+        centre.1 - MOON_LORD_HAND_UP,
+    )
+}
+
+/// The point a hand is easing toward this tick: its station, except during the sphere barrage's
+/// gather, when vanilla swings it out to `Center + (400 * side, -60)` and holds it there until the
+/// launch (`NPC.cs:42173-42260`). The barrage's internal movement phases are not pinned by the
+/// citations (the lid opens again at 210), so this holds one point until `num2 == 292` rather than
+/// staging them.
+fn hand_target(npc: &Npc, centre: (f32, f32), attack: u8, within: f32) -> (f32, f32) {
+    if attack == 2 && within < SPHERE_LAUNCH {
+        let side = if npc.ai[2] >= 1.0 { 1.0 } else { -1.0 };
+        (
+            centre.0 + side * HAND_BARRAGE_OUT,
+            centre.1 - HAND_BARRAGE_UP,
+        )
+    } else {
+        hand_station(npc, centre)
+    }
+}
+
+/// Ease a hand one tick toward a point. This is the station ease this module already carried;
+/// vanilla's own `SimpleFlyMovement` speed and acceleration are not pinned by the citations.
+fn ease_hand(npc: &mut Npc, to: (f32, f32)) {
+    let (cx, cy) = npc.center();
+    npc.velocity = ((to.0 - cx) * 0.2, (to.1 - cy) * 0.2);
 }
 
 /// How shut the eye is during this step, from 0 (wide open) to 3 (shut).
@@ -446,17 +495,19 @@ fn run_hand_attack(
             }
         }
         2 => {
-            // ML-5: the heavy attack is SIX spheres, not one. Vanilla gathers six proj 454 over a
-            // hundred and eighty ticks (`num12 % 30 == 0`, six times) and launches them together
-            // toward the player at `num2 == 292` (`NPC.cs:42184-42260`). The projectile layer has no
-            // hover-then-relaunch AI (the same narrowing the deathray already carries), so the six
-            // are fired as one aimed fan at the launch tick rather than gathered first.
-            if within as i32 == 292 {
+            // ML-5: the heavy attack is SIX spheres, not one. Vanilla gathers six proj 454 one
+            // every thirty ticks over a hundred and eighty ticks (`num12 % 30 == 0`, six times)
+            // while the hand holds the barrage point, then launches them together toward the
+            // player at `num2 == 292` (`NPC.cs:42184-42260`). The projectile layer has no
+            // hover-then-relaunch AI (the same narrowing the deathray carries), so the six are
+            // fired as one aimed fan at the launch tick rather than orbited first; the hand's own
+            // swing out and hold is `hand_target`.
+            if within as i32 == SPHERE_LAUNCH as i32 {
                 fire_fan(
                     npc,
                     out,
                     target,
-                    6,
+                    SPHERE_COUNT,
                     PHANTASMAL_SPHERE,
                     PHANTASMAL_SPHERE_DAMAGE,
                     12.0,
@@ -582,9 +633,10 @@ fn fire_fan(
 /// attacks between the rests. This used to fly straight at the player at nine pixels a tick and
 /// never shoot, so once all three sockets were open the fight had nothing left applying pressure.
 ///
-/// The narrowing is the same one the hands and the head already carry: this server's projectile
-/// layer has no gather-then-relaunch AI, so the sphere barrage and the eye-spray are fired as aimed
-/// fans at the tick vanilla launches them rather than orbited first.
+/// The narrowing is the same one the other sphere barrages carry: this server's projectile layer
+/// has no gather-then-relaunch AI, so the sphere barrage and the eye-spray are fired as aimed fans
+/// at the tick vanilla launches them rather than orbited first. The hand's own swing out around its
+/// barrage is now modelled separately in `hand_target`.
 pub fn free_eye(
     npc: &mut Npc,
     world: &World<'_, impl TileView>,
@@ -792,6 +844,36 @@ mod tests {
 
     fn piece(npc_type: u16) -> Npc {
         Npc::new(npc_type, (0.0, 0.0), 1).expect("a piece of the Moon Lord")
+    }
+
+    /// Put a part's centre where a test wants it, rather than working out its top-left corner.
+    fn seat(npc: &mut Npc, center: (f32, f32)) {
+        let (w, h) = (npc.width(), npc.height());
+        npc.position = (center.0 - w / 2.0, center.1 - h / 2.0);
+    }
+
+    /// Seed `ai[1]` so the next `eye_socket` call is the first tick of `attack`, where `within ==
+    /// 0`. `step_timeline` increments the timer before choosing the step, hence the one-tick lead.
+    fn seek_attack(npc: &mut Npc, attack: u8) {
+        let row = &MOON_LORD_SCRIPTS[attack_row(npc, false)];
+        let mut start = 0i32;
+        for &(a, dur) in row {
+            if a == attack {
+                npc.ai[1] = (start - 1) as f32;
+                return;
+            }
+            start += dur;
+        }
+        panic!("no attack {attack} in this row");
+    }
+
+    /// One hand tick, with the movement `step_physics` would apply. A Moon Lord hand has no
+    /// gravity and ignores tiles, so that is just its velocity added to its position.
+    fn tick_hand(hand: &mut Npc, w: &World<'_, Sky>, core: Parent) -> MoonLordOutcome {
+        let out = eye_socket(hand, w, Some(core));
+        hand.position.0 += hand.velocity.0;
+        hand.position.1 += hand.velocity.1;
+        out
     }
 
     /// BS3-M2: the head puts out three leeches a cycle, on the *player*, not eight on itself.
@@ -1154,6 +1236,152 @@ mod tests {
                 .count();
         }
         assert_eq!(spheres, 6, "six spheres launched together, not one");
+    }
+
+    /// The hand leaves its station for the sphere barrage. Vanilla swings it out to
+    /// `Center + (400 * side, -60)` before the six spheres gather (`NPC.cs:42173-42260`); the old
+    /// hand eased to `Center + (350 * side, -100)` and stayed there through every attack.
+    #[test]
+    fn moon_lord_hands_swing_out_for_the_sphere_barrage() {
+        let tiles = Sky(HashMap::new());
+        let w = world(&tiles, Some((900.0, 900.0)));
+        let core_part = core_at((0.0, 0.0), state::WAITING);
+        let (bx, by) = core_part.center();
+
+        for (ai2, side) in [(0.0, -1.0), (1.0, 1.0)] {
+            let mut hand = piece(MOON_LORD_HAND);
+            hand.ai[2] = ai2;
+            seek_attack(&mut hand, 2);
+            let station = (bx + side * MOON_LORD_HAND_OUT, by - MOON_LORD_HAND_UP);
+            seat(&mut hand, station);
+            for _ in 0..40 {
+                tick_hand(&mut hand, &w, core_part);
+            }
+            let (cx, cy) = hand.center();
+            let wanted = (bx + side * HAND_BARRAGE_OUT, by - HAND_BARRAGE_UP);
+            assert!(
+                (cx - wanted.0).abs() < 2.0 && (cy - wanted.1).abs() < 2.0,
+                "ai[2] {ai2} should have swung out to {wanted:?}, got ({cx}, {cy})"
+            );
+            assert!(
+                (cx - station.0).abs() > 10.0,
+                "and it has to actually leave its station at {station:?}"
+            );
+        }
+    }
+
+    /// The six spheres are gathered while the hand holds the barrage point and launched together
+    /// at `num2 == 292` (`NPC.cs:42184-42260`). The cadence is cited (`num12 % 30 == 0`, six
+    /// times); where the first mark falls is not, so this uses the six marks inside the lid's
+    /// 30..210 gather window. The projectile layer cannot orbit them, so the hold is what is
+    /// visible here and the launch stays one fan.
+    #[test]
+    fn six_spheres_gather_before_launch() {
+        let tiles = Sky(HashMap::new());
+        let w = world(&tiles, Some((900.0, 900.0)));
+        let core_part = core_at((0.0, 0.0), state::WAITING);
+        let (bx, by) = core_part.center();
+        let hold = (bx - HAND_BARRAGE_OUT, by - HAND_BARRAGE_UP);
+
+        let mut hand = piece(MOON_LORD_HAND);
+        hand.ai[2] = 0.0;
+        seek_attack(&mut hand, 2);
+        seat(&mut hand, (bx - MOON_LORD_HAND_OUT, by - MOON_LORD_HAND_UP));
+
+        let mut launches: Vec<(usize, usize)> = Vec::new();
+        let mut gathers = 0;
+        for within in 0..330 {
+            let before = hand.center();
+            let out = tick_hand(&mut hand, &w, core_part);
+            let fired: Vec<_> = out
+                .shots
+                .iter()
+                .filter(|s| s.projectile == PHANTASMAL_SPHERE)
+                .collect();
+            if !fired.is_empty() {
+                for shot in &fired {
+                    assert_eq!(
+                        shot.position, before,
+                        "the six gather at the hand and leave from there"
+                    );
+                }
+                launches.push((within, fired.len()));
+            }
+            if within < SPHERE_LAUNCH as usize {
+                assert!(
+                    fired.is_empty(),
+                    "no sphere launches during the gather (within {within})"
+                );
+            }
+            if [30, 60, 90, 120, 150, 180].contains(&within) {
+                let (cx, cy) = hand.center();
+                assert!(
+                    (cx - hold.0).abs() < 2.0 && (cy - hold.1).abs() < 2.0,
+                    "the hand holds {hold:?} through gather mark {within}, got ({cx}, {cy})"
+                );
+                gathers += 1;
+            }
+        }
+        assert_eq!(gathers, 6, "six gather marks, thirty ticks apart");
+        assert_eq!(
+            launches,
+            vec![(SPHERE_LAUNCH as usize, SPHERE_COUNT)],
+            "all six launch together at the vanilla tick, and nothing else in the step"
+        );
+    }
+
+    /// After the launch the hand goes home. Vanilla's barrage step runs on to 330 and then into
+    /// the pause at its station, and the swing out is not somewhere it can stay: it has to come
+    /// back for the next attack.
+    #[test]
+    fn hands_return_to_station_after_the_barrage() {
+        let tiles = Sky(HashMap::new());
+        let w = world(&tiles, Some((900.0, 900.0)));
+        let core_part = core_at((0.0, 0.0), state::WAITING);
+        let (bx, by) = core_part.center();
+        let station = (bx - MOON_LORD_HAND_OUT, by - MOON_LORD_HAND_UP);
+        let hold = (bx - HAND_BARRAGE_OUT, by - HAND_BARRAGE_UP);
+
+        let mut hand = piece(MOON_LORD_HAND);
+        hand.ai[2] = 0.0;
+        seek_attack(&mut hand, 2);
+        seat(&mut hand, station);
+
+        // It is still out at the launch point when the six spheres leave.
+        for _ in 0..SPHERE_LAUNCH as usize {
+            tick_hand(&mut hand, &w, core_part);
+        }
+        let (cx, cy) = hand.center();
+        assert!(
+            (cx - hold.0).abs() < 2.0 && (cy - hold.1).abs() < 2.0,
+            "the hand should still be out at {hold:?} when the barrage launches, got ({cx}, {cy})"
+        );
+
+        let out = tick_hand(&mut hand, &w, core_part);
+        assert_eq!(
+            out.shots
+                .iter()
+                .filter(|s| s.projectile == PHANTASMAL_SPHERE)
+                .count(),
+            SPHERE_COUNT,
+            "the launch is the barrier it turns around at"
+        );
+        assert!(
+            hand.velocity.0 > 0.0,
+            "the left hand should be moving back in from the out point, got {:?}",
+            hand.velocity
+        );
+
+        // The rest of the barrage step (37 ticks) plus the pause that follows is ample time for
+        // the station ease to settle.
+        for _ in 0..90 {
+            tick_hand(&mut hand, &w, core_part);
+        }
+        let (cx, cy) = hand.center();
+        assert!(
+            (cx - station.0).abs() < 1.0 && (cy - station.1).abs() < 1.0,
+            "the hand should be back at its station {station:?}, got ({cx}, {cy})"
+        );
     }
 
     /// ML-4: the head fires the deathray and puts out leeches, and runs neither of a hand's attacks;

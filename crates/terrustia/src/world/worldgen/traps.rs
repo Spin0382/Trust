@@ -618,7 +618,16 @@ fn place_boulder_trap(
     } else {
         BOULDER
     };
-    place_tile(world, cx + 1, floor_y + 1, boulder, -1, -1);
+    // A boulder is one framed 2x2 object, not a single unframed tile: `TileObjectData` gives every
+    // variant above its own 2x2 layout and `WorldGen.PlaceObject` writes all four cells' frames.
+    // The chamber carve earlier cleared rows `floor_y..=floor_y + 1`, and the row beneath the
+    // footprint was just filled with dirt, so this is the same write vanilla makes. Anchoring at
+    // `(cx, floor_y + 1)` is the object's own origin (0, 1): bottom-left, with its top-left on
+    // `(cx, floor_y)`. If the write is refused (an unbreakable tile left in the footprint, say),
+    // the trap is not a trap and the caller must not count it.
+    if !super::place_object::place_object(world, cx, floor_y + 1, boulder, 0, -1) {
+        return None;
+    }
 
     let mut fy = floor_y + 2;
     for dxx in 0..2 {
@@ -992,6 +1001,7 @@ mod tests {
     use super::*;
     use crate::world::wiring;
     use rand::SeedableRng;
+    use terrustia_proto::tile_object;
 
     /// 1200 tall, matching vanilla's own minimum world height: `placeTrap`'s `near_bottom` guard
     /// is `y >= height - 300`, a constant tuned for a real world, and a much shorter test world
@@ -1302,6 +1312,108 @@ mod tests {
         assert_eq!(
             plate.frame_y, 126,
             "a boulder trap's plate style is always 7 (frameY = 7*18 = 126)"
+        );
+    }
+
+    /// The boulder the trap drops into its chamber has to be a real framed 2x2 object, not one
+    /// unframed tile. A single tile at the old write's frame (-1, -1) is not a boulder a client
+    /// can even render as one, and leaves mining it with nothing to resolve its other three cells
+    /// from. The variant is rolled, so every member of `TileID.Sets.Boulders` is accepted; what
+    /// must hold is that all four cells exist, carry the same type, and frame like the four cells
+    /// of one object.
+    #[test]
+    fn a_boulder_trap_places_a_framed_2x2_boulder() {
+        let mut world = corridor();
+        let layout = layout(&world);
+        let mut rng = SmallRng::seed_from_u64(1);
+        let mut pets = 0;
+
+        let placed = place_boulder_trap(&mut world, &layout, 60, 90, &mut rng, &mut pets);
+        assert_eq!(
+            placed,
+            Some(TrapKind::Boulder),
+            "the chamber should accept a boulder trap here"
+        );
+
+        // Find the boulder by scanning the chamber region, then walk back from whichever cell was
+        // found to the object's top-left using the shared `TileObjectData` arithmetic.
+        let mut anchor = None;
+        'scan: for x in 50..70 {
+            for y in 70..92 {
+                let t = world.tile(x, y);
+                if t.is_active() && is_boulder(t.block) {
+                    let (dx, dy) = tile_object::origin_of(t.block, t.frame_x, t.frame_y)
+                        .expect("every boulder is in TileObjectData");
+                    anchor = Some((x - dx, y - dy));
+                    break 'scan;
+                }
+            }
+        }
+        let (ax, ay) = anchor.expect("the boulder trap should have written a boulder");
+        let block = world.tile(ax, ay).block;
+        assert!(is_boulder(block), "cell (0,0) is {block}, not a boulder");
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let t = world.tile(ax + dx, ay + dy);
+                assert!(t.is_active(), "boulder cell ({dx},{dy}) is missing");
+                assert_eq!(
+                    t.block, block,
+                    "boulder cell ({dx},{dy}) is a different tile type"
+                );
+                assert!(
+                    t.frame_x >= 0 && t.frame_y >= 0,
+                    "boulder cell ({dx},{dy}) is unframed: frame ({}, {})",
+                    t.frame_x,
+                    t.frame_y
+                );
+                assert_eq!(
+                    tile_object::origin_of(block, t.frame_x, t.frame_y),
+                    Some((dx, dy)),
+                    "boulder cell ({dx},{dy}) does not frame like part of the same 2x2 object"
+                );
+            }
+        }
+    }
+
+    /// Smoothing runs after every decoration pass in this pipeline, so it must not slope, pound
+    /// or kill any cell of a framed boulder. `can_pound_tile` refuses `TileID.Sets.Boulders`,
+    /// `kill_tile` refuses every frame-important type, and neither may strand three cells of the
+    /// object behind. The floor directly under the anchor is protected by `protects_tile_below`
+    /// as well.
+    #[test]
+    fn smoothing_leaves_a_framed_boulder_anchor_alone() {
+        use crate::world::worldgen::rand::UnifiedRandom;
+
+        let mut world = World::empty(120, 120, "smooth-boulder");
+        let layout = layout(&world);
+        let mut rand = UnifiedRandom::new(3);
+
+        for x in 40..80 {
+            for y in 60..70 {
+                world.set_tile(x, y, Tile::block(1));
+            }
+        }
+        // A framed boulder anchored at (60, 59) occupies (60, 58)..(61, 59), standing on the row
+        // filled above.
+        assert!(
+            crate::world::worldgen::place_object::place_object(&mut world, 60, 59, BOULDER, 0, -1),
+            "the boulder should place on the floor"
+        );
+        let before: Vec<Tile> = (58..=60)
+            .flat_map(|y| (60..=61).map(move |x| (x, y)))
+            .map(|(x, y)| world.tile(x, y))
+            .collect();
+
+        crate::world::worldgen::smooth::smooth(&mut world, &layout, &mut rand);
+
+        let after: Vec<Tile> = (58..=60)
+            .flat_map(|y| (60..=61).map(move |x| (x, y)))
+            .map(|(x, y)| world.tile(x, y))
+            .collect();
+        assert_eq!(
+            before, after,
+            "a smoothing pass must leave a framed boulder's four cells and the floor under them \
+             exactly as they were"
         );
     }
 
