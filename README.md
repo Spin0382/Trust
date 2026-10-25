@@ -245,8 +245,9 @@ against these notes. [`AUDIT.md`](AUDIT.md) has the findings behind it, and
 
 Tier 1 (the passes that make a world stop looking like a prototype), Tier 2 (biome set pieces) and
 Tier 3 (the cosmetic and cleanup tail) are all done, and so are all 15 real `MicroBiome` classes.
-What is left: eight of the nine known secret seeds' own generation-content differences (the ninth,
-No Traps World, is done).
+All nine known secret seeds have their own generation content, landed 2026-09-08. What is left is
+per-pass detail and seed combinations: each seed is transcribed with the other seeds' branches
+taken as false, and seed-identical worlds are out of scope.
 
 The last seven classes closed together, and one change is why. `worldgen/genpipe.rs` is a real
 transcription of vanilla's own shape/modifier/action generation pipeline, which this project had

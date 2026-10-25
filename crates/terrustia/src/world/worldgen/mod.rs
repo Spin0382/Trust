@@ -350,15 +350,12 @@ pub fn build_with_secret_seed(
     // Drunk World is the one seed that changes the *layout* rather than decorating it: both evils,
     // one per half of the world (`WorldGen.cs:2052-2062`). Decided here, before terrain runs, so
     // every pass that asks `evil_at` gets a consistent answer.
-    // Remix reads the *detected* seed, not the honoured one, and the difference is the point.
-    // `honoured_by_this_generator` strips the remix flag so the world file never claims a shape it
-    // does not have - see that function's doc. But the tiles can still be generated Remix's way,
-    // and every site that has been ported is strictly closer to the seed than an ordinary world
-    // would be. Generating like Remix is a fact about the tiles; claiming `remixWorld` is a promise
-    // to the client. This does the first and not the second.
+    // Remix reads the *detected* seed so the seed's own shape is applied before any flag is
+    // written. `honoured_by_this_generator` now drops nothing, and the tiles have the shape the
+    // flag describes, so the world claims `remixWorld` - see the test below.
     //
-    // This was wrong for nine commits: the passes were gated on `honoured.remix`, which is always
-    // false, so none of them ever ran. A test asserting the spawn moved is what caught it.
+    // This was wrong for nine commits: the passes were gated on `honoured.remix`, which was always
+    // false then, so none of them ever ran. A test asserting the spawn moved is what caught it.
     if secret.remix {
         plan.remix = true;
         // `TerrainPass.cs:66-73`: Remix drives the rock layer far deeper - half the world's height,
