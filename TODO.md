@@ -1495,10 +1495,10 @@ roster asked at neutral luck alone would keep reporting it unreachable for ever.
 
 ## Phase 3: after v0.0.1, in order
 
-1. **v0.0.2, the worldgen release**: **eight of the nine secret seeds landed 2026-09-08** (Not the
-   Bees, Drunk World, Celebrationmk10, "get fixed boi", Don't Starve, Skyblock, For the Worthy,
-   plus No Traps which was already wired). Remix is the one left, and it is the largest: 211 call
-   sites, all of them depth inversions, which makes it a generator-wide change rather than a pass.
+1. **v0.0.2, the worldgen release**: **all nine secret seeds landed 2026-09-08**, Remix included
+   (Not the Bees, Drunk World, Celebrationmk10, "get fixed boi", Don't Starve, Skyblock, For the
+   Worthy, No Traps, Remix). Remix was the last and the largest: 211 call sites, all of them depth
+   inversions, which made it a generator-wide change rather than a pass.
    An attempt that mirrored the world left-to-right instead was written and deleted; see
    `secret_seed.rs`. Each landed seed is transcribed with the other seeds' branches taken as false,
    so seed *combinations* are the other open piece. (Historical note: Don't
