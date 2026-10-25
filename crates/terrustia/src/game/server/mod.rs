@@ -3398,8 +3398,8 @@ mod rollback_exit {
         let dir = crate::safe_write::tests::temp_dir("rollback-exit");
         let path = dir.join("world.wld");
         let bytes = crate::world::wld_save::serialize(&crate::world::worldgen::generate(
-            200,
-            150,
+            400,
+            300,
             "rollback probe",
             1,
         ))
@@ -3413,7 +3413,7 @@ mod rollback_exit {
         };
         let mut server = GameServer::new(
             config,
-            crate::world::worldgen::generate(200, 150, "rollback probe", 1),
+            crate::world::worldgen::generate(400, 300, "rollback probe", 1),
         );
 
         let message = server.roll_back(1).expect("rollback should succeed");
