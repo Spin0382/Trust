@@ -151,7 +151,9 @@ pub fn serialize(world: &World) -> Result<Vec<u8>> {
             TOWN_MANAGER_SECTION => write_town_rooms(&mut w, world),
             // Preserve a real section byte for byte. A section shorter than the three counts
             // cannot be one, and the empty shape is safer than passing a truncated read on.
-            BESTIARY_SECTION if section.len() >= 12 => w.bytes(section),
+            BESTIARY_SECTION if section.len() >= 12 => {
+                w.bytes(section);
+            }
             BESTIARY_SECTION => write_bestiary(&mut w),
             JOURNEY_SECTION => write_journey_powers(&mut w, world),
             _ => {
