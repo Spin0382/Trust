@@ -930,7 +930,7 @@ mod tests {
     fn dead_player_names_one_slot() {
         // `NetMessage.SyncOnePlayer`'s 135 body is a single byte, the player id.
         let frame = dead_player(7).unwrap();
-        assert_eq!(frame, vec![3, 0, id::DEAD_PLAYER, 7]);
+        assert_eq!(frame, vec![4, 0, id::DEAD_PLAYER, 7]);
         assert_eq!(payload(&frame), &[7u8]);
     }
 
