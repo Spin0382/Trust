@@ -74,6 +74,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `github.repository` keeps the owner's and repo's casing, and OCI references must be
+      # lowercase. buildx normalises the name it pushes, but cosign parses the reference
+      # literally, so a repository named `Trust` made the signing step fail.
+      - name: Lowercase the image name
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           path: dist
