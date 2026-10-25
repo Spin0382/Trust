@@ -38,6 +38,20 @@ async fn main() -> ExitCode {
     // even sees the rest of the arguments, the same way a bare word ahead of any flag would
     // otherwise just be reported as "unrecognised argument".
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // Hidden, internal, Windows-only: `update::install` starts this detached so it can outlive
+    // this process and replace the binary this process is running from. Never documented, and
+    // never reached by an ordinary server or `terrustia update` invocation. On every other
+    // platform the name stays an ordinary unrecognised argument, exactly as before.
+    #[cfg(windows)]
+    if raw_args.first().map(String::as_str) == Some(terrustia::update::APPLY_UPDATE_SUBCOMMAND) {
+        return match terrustia::update::run_apply_helper(std::env::args_os().skip(2).collect()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                error!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw_args.first().map(String::as_str) == Some("update") {
         return match terrustia::update::run_update_command(&raw_args[1..]).await {
             Ok(()) => ExitCode::SUCCESS,
@@ -49,7 +63,7 @@ async fn main() -> ExitCode {
     }
 
     match run(palette).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(outcome) => ExitCode::from(outcome.exit_code()),
         Err(e) => {
             error!("{e}");
             ExitCode::FAILURE
@@ -57,16 +71,16 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(palette: Palette) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(palette: Palette) -> Result<Stopped, Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let mut args = Args::parse(raw_args.iter().cloned())?;
     if args.help {
         print_usage(palette);
-        return Ok(());
+        return Ok(Stopped::Cleanly);
     }
     if args.list_worlds {
         print_worlds(palette);
-        return Ok(());
+        return Ok(Stopped::Cleanly);
     }
 
     // Opt-in-triggered, not the zero-flag default path: `--setup` always asks; a genuinely
@@ -393,6 +407,7 @@ async fn run(palette: Palette) -> Result<(), Box<dyn std::error::Error>> {
     // A crash and a clean stop used to be indistinguishable from out here, so a server that had
     // panicked still exited 0 and no supervisor restarted it.
     let mut crashed = false;
+    let mut game_outcome = Stopped::Cleanly;
     // `ended = &mut game` already resolves `game`'s `JoinHandle` when the game task stops on its
     // own (a console `stop`, among other things) — awaiting it again below would poll a
     // `JoinHandle` a second time after it already completed, which panics. This flag is `true`
@@ -409,6 +424,12 @@ async fn run(palette: Palette) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Stopped::Panicked) => {
                     error!("the game loop stopped because something panicked");
                     crashed = true;
+                }
+                Ok(Stopped::RolledBack) => {
+                    info!(
+                        "game task ended after a rollback; the restored world will load on restart"
+                    );
+                    game_outcome = Stopped::RolledBack;
                 }
                 Err(e) if e.is_cancelled() => info!("game task cancelled"),
                 Err(e) => {
@@ -430,6 +451,7 @@ async fn run(palette: Palette) -> Result<(), Box<dyn std::error::Error>> {
     if still_running {
         match game.await {
             Ok(Stopped::Panicked) => crashed = true,
+            Ok(Stopped::RolledBack) => game_outcome = Stopped::RolledBack,
             Ok(Stopped::Cleanly) => {}
             Err(e) if e.is_cancelled() => {}
             Err(e) => {
@@ -459,9 +481,10 @@ async fn run(palette: Palette) -> Result<(), Box<dyn std::error::Error>> {
             listen_addr,
             panel_live.load(std::sync::atomic::Ordering::Relaxed),
         )
+        .map(|()| game_outcome)
         .map_err(|e| format!("could not restart into {}: {e}", new_world.display()).into());
     }
-    Ok(())
+    Ok(game_outcome)
 }
 
 /// Replace this process with a fresh one pointed at `world`, keeping the config file and listen

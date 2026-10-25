@@ -9,10 +9,13 @@
 //!   applies anything.
 //! - [`run_update_command`] is what `terrustia update` on the command line actually does: the same
 //!   check, then (unless `--check` was given) downloading, verifying and installing the matching
-//!   platform build. This is the *manual apply* — an operator runs it on purpose. A running
+//!   platform build. This is the *manual apply* - an operator runs it on purpose. A running
 //!   production server is never restarted out from under itself; see `packaging/terrustia.service`
 //!   and this crate's `main.rs` for why that stays a human decision everywhere else in this
-//!   project too.
+//!   project too. On Windows the final swap is performed by a short-lived detached helper after
+//!   the update process exits, because Windows will not let a running image replace its own file.
+//!   The helper waits for that exit, retries the swap, restores the target on failure, and starts
+//!   the new binary with the arguments and working directory this process was given.
 //!
 //! **The trust chain is not reinvented here.** `.github/workflows/release.yml` already signs every
 //! release asset — including `SHA256SUMS` itself — with `cosign sign-blob`, keyless, using the
@@ -24,6 +27,7 @@
 //! rather than silently downgrading to "checked but unverified": see [`UpdateError::CosignMissing`].
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -53,12 +57,11 @@ pub enum ApplyOutcome {
     /// No newer, verifiable release exists. Not an error — this is the ordinary answer, and
     /// `terrustia update` is meant to be safe to run any time out of habit.
     AlreadyUpToDate,
-    /// Downloaded, signature-verified, and swapped in over the running binary's own file.
+    /// Downloaded, signature-verified, and installed over the running binary's own file. On
+    /// Windows the swap itself is completed by a detached helper once this process exits; by the
+    /// time this outcome is returned the helper has been started and the verified binary is
+    /// staged beside the target. See [`install`]'s Windows arm.
     Applied { tag: String, path: PathBuf },
-    /// Downloaded and signature-verified, but this platform cannot safely replace its own running
-    /// executable image the way Unix's atomic rename does — see the `apply` doc comment on the
-    /// `cfg(not(unix))` branch for why this is a disclosed gap rather than a guess.
-    DownloadedForManualApply { tag: String, path: PathBuf },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -440,7 +443,7 @@ fn extract_archive(archive: &Path, dest_dir: &Path, _is_zip: bool) -> Result<(),
 /// GitHub's native `windows-11-arm` runner (`ci.yml`'s cross-compile job, host-native there, not
 /// cross-compiled), but that job runs `cargo check`, not `cargo test`, so this function's actual
 /// runtime behavior on real Windows is still never executed anywhere in CI: disclosed here, and
-/// in `update.rs`'s other two `cfg(windows)` sites, rather than left implicit.
+/// in `update.rs`'s other `cfg(windows)` sites, rather than left implicit.
 #[cfg(windows)]
 fn extract_archive(archive: &Path, dest_dir: &Path, _is_zip: bool) -> Result<(), UpdateError> {
     let status = Command::new("tar")
@@ -482,19 +485,495 @@ fn install(new_binary: &Path, tag: &str, target: &Path) -> Result<ApplyOutcome, 
     })
 }
 
-/// Windows cannot overwrite its own running executable's file — this very process is that file,
-/// executing, while `terrustia update` runs. The verified binary is left beside it instead of
-/// guessing at a rename-out-from-under-itself trick nothing here has a way to prove safe; the
-/// operator finishes the swap once the server is stopped. See `extract_archive`'s doc comment for
-/// what CI's `windows-11-arm` runner does and does not exercise of this module's Windows path.
+/// The hidden subcommand [`install`] starts on Windows, and the branch `main` recognises before it
+/// parses ordinary arguments. Deliberately absent from `--help`: it is an implementation detail of
+/// the Windows self-update path, not an operator command.
+#[doc(hidden)]
+pub const APPLY_UPDATE_SUBCOMMAND: &str = "__apply-update";
+
+/// How the helper is told what to do. The three positional values are fixed; everything after them
+/// is the argument list the parent was started with, replayed against the replacement binary.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct ApplyHelperArgs {
+    parent_pid: u32,
+    staged: PathBuf,
+    target: PathBuf,
+    relaunch_args: Vec<OsString>,
+}
+
+#[cfg(any(windows, test))]
+fn parse_apply_helper_args(args: &[OsString]) -> Result<ApplyHelperArgs, String> {
+    const USAGE: &str = "needs <parent-pid> <staged> <target>";
+    let Some((pid, rest)) = args.split_first() else {
+        return Err(format!("{APPLY_UPDATE_SUBCOMMAND} {USAGE}"));
+    };
+    let Some((staged, rest)) = rest.split_first() else {
+        return Err(format!("{APPLY_UPDATE_SUBCOMMAND} {USAGE}"));
+    };
+    let Some((target, relaunch_args)) = rest.split_first() else {
+        return Err(format!("{APPLY_UPDATE_SUBCOMMAND} {USAGE}"));
+    };
+    let parent_pid = pid
+        .to_str()
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| {
+            format!(
+                "parent pid is not a positive integer: {}",
+                pid.to_string_lossy()
+            )
+        })?;
+    Ok(ApplyHelperArgs {
+        parent_pid,
+        staged: PathBuf::from(staged.as_os_str()),
+        target: PathBuf::from(target.as_os_str()),
+        relaunch_args: relaunch_args.to_vec(),
+    })
+}
+
+/// The command line the parent hands the helper. Split out from the spawn so the ordering (and the
+/// fact that the original arguments are preserved byte for byte as `OsString`s) can be tested
+/// without starting a process.
+#[cfg(any(windows, test))]
+fn helper_command_arguments(
+    parent_pid: u32,
+    staged: &Path,
+    target: &Path,
+    relaunch_args: &[OsString],
+) -> Vec<OsString> {
+    let mut args = Vec::with_capacity(relaunch_args.len() + 4);
+    args.push(OsString::from(APPLY_UPDATE_SUBCOMMAND));
+    args.push(OsString::from(parent_pid.to_string()));
+    args.push(staged.as_os_str().to_os_string());
+    args.push(target.as_os_str().to_os_string());
+    args.extend(relaunch_args.iter().cloned());
+    args
+}
+
+/// Move `staged` over `target`, keeping the old file at `backup` until the move succeeds, and
+/// restore it if the final rename fails. Retried because antivirus and other file scanners can
+/// hold either file open long enough to deny a rename for a moment.
+///
+/// Compiled for tests on every platform, so the retry and restore decisions themselves are
+/// exercised by a real filesystem on a Linux host rather than only on the Windows CI runners.
+#[cfg(any(windows, test))]
+fn replace_target_with_retries(
+    target: &Path,
+    staged: &Path,
+    backup: &Path,
+    attempts: u32,
+    delay: Duration,
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let mut last_error = String::new();
+    for attempt in 1..=attempts {
+        if attempt > 1 {
+            std::thread::sleep(delay);
+        }
+        // A previous attempt whose second rename failed and whose restore also failed leaves the
+        // target missing. Put the backup back before trying again, or every later attempt would
+        // start by trying to move a file that is not there.
+        if !target.exists()
+            && backup.exists()
+            && let Err(e) = std::fs::rename(backup, target)
+        {
+            last_error = format!(
+                "restoring {} from {}: {e}",
+                target.display(),
+                backup.display()
+            );
+            continue;
+        }
+        if let Err(e) = std::fs::rename(target, backup) {
+            last_error = format!("moving {} aside: {e}", target.display());
+            continue;
+        }
+        match std::fs::rename(staged, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let replace_error = format!("moving {} into place: {e}", staged.display());
+                match std::fs::rename(backup, target) {
+                    Ok(()) => last_error = replace_error,
+                    Err(restore_error) => {
+                        return Err(format!(
+                            "{replace_error}; restoring {} from {} also failed: {restore_error}",
+                            target.display(),
+                            backup.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Err(format!(
+        "giving up after {attempts} attempts; last error: {last_error}"
+    ))
+}
+
+/// Windows cannot overwrite its own running executable's file, so the verified binary is staged
+/// beside the target and a detached helper is started. The helper waits for this process to exit,
+/// backs up the target, moves the staged file into place with retries, restores the original if
+/// every attempt fails, and relaunches with the arguments and working directory this process was
+/// given. See `windows_apply`'s own doc comment for what that path cannot prove from CI.
 #[cfg(windows)]
 fn install(new_binary: &Path, tag: &str, target: &Path) -> Result<ApplyOutcome, UpdateError> {
-    let beside = target.with_file_name("terrustia.exe.new");
-    std::fs::copy(new_binary, &beside).map_err(|e| UpdateError::Apply(e.to_string()))?;
-    Ok(ApplyOutcome::DownloadedForManualApply {
+    // Unpredictable and unique rather than a fixed `.new` name: the install directory is trusted
+    // enough to hold the executable, but a predictable staging name is still free to pre-create
+    // there, and `copy` would follow whatever was placed at it. `keep` makes the file outlive the
+    // `TempDir` that `apply` drops immediately after this function returns.
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut staging = tempfile::Builder::new()
+        .prefix("terrustia-update-")
+        .suffix(".exe")
+        .tempfile_in(parent)
+        .map_err(|e| {
+            UpdateError::Apply(format!(
+                "creating a staging file beside {}: {e}",
+                target.display()
+            ))
+        })?;
+    // Through the handle `tempfile` already opened, not by path: there is no window in which
+    // something else could take the staging name between creation and the copy.
+    let mut source = std::fs::File::open(new_binary)
+        .map_err(|e| UpdateError::Apply(format!("opening the verified binary: {e}")))?;
+    std::io::copy(&mut source, staging.as_file_mut())
+        .map_err(|e| UpdateError::Apply(format!("staging the new binary: {e}")))?;
+    let staged = staging
+        .into_temp_path()
+        .keep()
+        .map_err(|e| UpdateError::Apply(format!("keeping the staged binary: {e}")))?;
+    if let Err(e) = windows_apply::spawn_helper(&staged, target) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(UpdateError::Apply(e));
+    }
+    Ok(ApplyOutcome::Applied {
         tag: tag.to_string(),
-        path: beside,
+        path: target.to_path_buf(),
     })
+}
+
+/// The Windows half of [`install`].
+///
+/// Every function here is either a Win32 call or a filesystem operation that is only reached on
+/// Windows. The narrow FFI is deliberate: opening one process handle and waiting on it does not
+/// justify taking a whole Windows API crate into a workspace that otherwise hand-rolls its
+/// operating-system surface (see `game/clock.rs`'s `GetThreadTimes` declaration for the same
+/// trade).
+///
+/// What cannot be proved from a Linux development machine, and therefore remains disclosed:
+/// antivirus or an EDR can hold either the staged file or the target open long enough to exhaust
+/// the retries; the parent is identified by PID alone, so a PID reused between the parent exiting
+/// and this helper opening it would be waited on instead; and a helper started from a service
+/// session has no console to give the relaunched process.
+#[cfg(windows)]
+mod windows_apply {
+    use super::{
+        ApplyHelperArgs, helper_command_arguments, parse_apply_helper_args,
+        replace_target_with_retries,
+    };
+    use std::{
+        ffi::{OsString, c_void},
+        fs::OpenOptions,
+        io::Write,
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    /// How long the helper waits for the process that started it. A server shutting down has to
+    /// finish saving first; an update command exits almost immediately. Bounded on purpose: a
+    /// helper that waited forever would hold the staged binary and the log open indefinitely.
+    const PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Ten seconds of retries at a quarter-second each. Antivirus scanners routinely hold a
+    /// freshly written executable for a second or two; a running image holds it until it exits.
+    const REPLACE_ATTEMPTS: u32 = 40;
+    const REPLACE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+    pub(super) fn spawn_helper(staged: &Path, target: &Path) -> Result<(), String> {
+        // The helper runs from the *staged* new binary, not from the target. Windows permits
+        // renaming a running executable, so either choice can move the old file aside; running
+        // from staged is what leaves the backup free to delete after the swap, because the
+        // helper's own image is at the target path rather than at the backup path. The staged
+        // binary is also the new release, which is what carries this subcommand.
+        let cwd =
+            std::env::current_dir().map_err(|e| format!("reading the working directory: {e}"))?;
+        let original_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+        let mut command = Command::new(staged);
+        command
+            .args(helper_command_arguments(
+                std::process::id(),
+                staged,
+                target,
+                &original_args,
+            ))
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // `DETACHED_PROCESS` (0x0000_0008) starts the helper with no console of its own, so the
+        // update command's exit, Ctrl-C, or a closing terminal window cannot take the helper with
+        // it. It has to outlive the process whose file it is going to replace.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(DETACHED_PROCESS);
+        command
+            .spawn()
+            .map_err(|e| format!("starting the update helper: {e}"))?;
+        Ok(())
+    }
+
+    pub(super) fn run(args: &[OsString]) -> Result<(), String> {
+        let parsed = parse_apply_helper_args(args)?;
+        let target = &parsed.target;
+        log(
+            target,
+            &format!(
+                "helper starting: parent pid {}, staged {}, target {}, {} relaunch argument(s)",
+                parsed.parent_pid,
+                parsed.staged.display(),
+                target.display(),
+                parsed.relaunch_args.len()
+            ),
+        );
+
+        match wait_for_process_exit(target, parsed.parent_pid, PARENT_EXIT_TIMEOUT) {
+            Ok(true) => log(target, "parent process has exited"),
+            Ok(false) => {
+                let message = format!(
+                    "parent pid {} is still running after {}s; leaving the target untouched",
+                    parsed.parent_pid,
+                    PARENT_EXIT_TIMEOUT.as_secs()
+                );
+                log(target, &message);
+                remove_staged(&parsed.staged, target);
+                return Err(message);
+            }
+            Err(e) => {
+                log(target, &format!("waiting for the parent failed: {e}"));
+                remove_staged(&parsed.staged, target);
+                return Err(e);
+            }
+        }
+
+        let backup = backup_path(target);
+        match replace_target_with_retries(
+            target,
+            &parsed.staged,
+            &backup,
+            REPLACE_ATTEMPTS,
+            REPLACE_RETRY_DELAY,
+        ) {
+            Ok(()) => {
+                log(
+                    target,
+                    &format!("replaced the target (backup {})", backup.display()),
+                );
+                remove_staged(&parsed.staged, target);
+                if let Err(e) = relaunch(&parsed) {
+                    log(
+                        target,
+                        &format!(
+                            "replacement succeeded but relaunch failed: {e}; the previous binary \
+                             is still at {}",
+                            backup.display()
+                        ),
+                    );
+                    return Err(e);
+                }
+                // Only after the replacement has actually started is the old file no longer
+                // useful as a fallback; until then it stays on disk for a human.
+                if let Err(e) = std::fs::remove_file(&backup) {
+                    log(
+                        target,
+                        &format!("could not remove backup {}: {e}", backup.display()),
+                    );
+                }
+                log(target, "relaunched the replacement");
+                Ok(())
+            }
+            Err(e) => {
+                log(target, &format!("replacement failed: {e}"));
+                // `replace_target_with_retries` restores on every failed attempt. A final restore
+                // can itself fail if the target was just released from a scanner but the backup
+                // was not; in that case the backup is the only copy left and must not be deleted.
+                if !target.exists() && backup.exists() {
+                    match std::fs::rename(&backup, target) {
+                        Ok(()) => log(target, "restored the original binary from the backup"),
+                        Err(restore) => log(
+                            target,
+                            &format!(
+                                "could not restore {} from {}: {restore}",
+                                target.display(),
+                                backup.display()
+                            ),
+                        ),
+                    }
+                }
+                remove_staged(&parsed.staged, target);
+                // Relaunching a failed update command would just download and try again, possibly
+                // forever. A server started with other arguments is different: bring it back on
+                // the old binary so a failed update does not leave the operator with nothing
+                // running.
+                if target.exists() && !is_update_command(&parsed.relaunch_args) {
+                    match relaunch(&parsed) {
+                        Ok(()) => log(target, "relaunched the original binary"),
+                        Err(relaunch_error) => {
+                            log(target, &format!("relaunch failed: {relaunch_error}"));
+                        }
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn is_update_command(args: &[OsString]) -> bool {
+        args.first().and_then(|arg| arg.to_str()) == Some("update")
+    }
+
+    fn relaunch(parsed: &ApplyHelperArgs) -> Result<(), String> {
+        let cwd =
+            std::env::current_dir().map_err(|e| format!("reading the working directory: {e}"))?;
+        let mut command = Command::new(&parsed.target);
+        command
+            .args(&parsed.relaunch_args)
+            .current_dir(&cwd)
+            // Inherited, not null: production's helper has null handles from its own detached
+            // spawn, while a test can hand the helper a file or a pipe and observe the relaunched
+            // process. Nothing about the relaunch should be more detached than its parent.
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        command
+            .spawn()
+            .map_err(|e| format!("starting {}: {e}", parsed.target.display()))?;
+        Ok(())
+    }
+
+    fn remove_staged(staged: &Path, target: &Path) {
+        if let Err(e) = std::fs::remove_file(staged)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log(
+                target,
+                &format!("could not remove staged file {}: {e}", staged.display()),
+            );
+        }
+    }
+
+    fn backup_path(target: &Path) -> PathBuf {
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("terrustia.exe");
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or(0);
+        target.with_file_name(format!("{name}.old-{}-{stamp}", std::process::id()))
+    }
+
+    /// The log is best effort: being unable to append to it must never be the reason an otherwise
+    /// successful replacement is abandoned. It sits beside the target, where the update already
+    /// needs write permission, and is appended to so a failed run from yesterday is still there.
+    fn log(target: &Path, message: &str) {
+        let path = log_path(target);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "[{stamp}] pid {}: {message}", std::process::id());
+        }
+    }
+
+    fn log_path(target: &Path) -> PathBuf {
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("terrustia.exe");
+        target.with_file_name(format!("{name}.update.log"))
+    }
+
+    /// Wait for `pid` to exit, up to `timeout`. `Ok(false)` means the timeout expired; `Ok(true)`
+    /// means the process is gone (including the case where it was already gone before a handle
+    /// could be opened).
+    ///
+    /// `OpenProcess` plus `WaitForSingleObject` is the whole Win32 surface needed, so it is
+    /// declared here rather than pulling in a Windows API crate. `ERROR_INVALID_PARAMETER` from
+    /// `OpenProcess` is the documented answer for a PID that no longer names a process; that
+    /// ordinary race (a short-lived update command exited before this helper was scheduled) is
+    /// treated as "already exited". Any other failure, access denied in particular, is reported
+    /// instead of being guessed at: proceeding could replace a file while the process that owns it
+    /// is still running, and refusing leaves the target exactly as it was.
+    #[allow(unsafe_code)]
+    fn wait_for_process_exit(target: &Path, pid: u32, timeout: Duration) -> Result<bool, String> {
+        unsafe extern "system" {
+            fn OpenProcess(
+                desired_access: u32,
+                inherit_handle: i32,
+                process_id: u32,
+            ) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+            fn CloseHandle(object: *mut c_void) -> i32;
+        }
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const WAIT_OBJECT_0: u32 = 0;
+        const WAIT_TIMEOUT: u32 = 0x0000_0102;
+        const WAIT_FAILED: u32 = 0xffff_ffff;
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+
+        // SAFETY: `OpenProcess` is called with a PID and the documented SYNCHRONIZE access. The
+        // returned handle is checked for null before use and closed exactly once below.
+        let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                log(target, &format!("parent pid {pid} had already exited"));
+                return Ok(true);
+            }
+            return Err(format!("opening parent pid {pid}: {error}"));
+        }
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: `handle` is a live process handle opened above with SYNCHRONIZE, which is the
+        // access `WaitForSingleObject` requires. No pointer is written through.
+        let result = unsafe { WaitForSingleObject(handle, millis) };
+        // SAFETY: the handle came from `OpenProcess`, is still owned here, and is not used again.
+        let _ = unsafe { CloseHandle(handle) };
+        match result {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(format!(
+                "waiting for parent pid {pid}: {}",
+                std::io::Error::last_os_error()
+            )),
+            other => Err(format!(
+                "waiting for parent pid {pid}: unexpected status {other}"
+            )),
+        }
+    }
+}
+
+/// Runs the hidden `__apply-update` subcommand. Windows-only in practice; the other platforms
+/// return an error rather than pretending to support it.
+#[doc(hidden)]
+pub fn run_apply_helper(args: Vec<OsString>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows_apply::run(&args)
+    }
+    #[cfg(not(windows))]
+    {
+        drop(args);
+        Err(format!(
+            "{APPLY_UPDATE_SUBCOMMAND} is an internal Windows-only subcommand"
+        ))
+    }
 }
 
 /// Runs once, in the background, at server boot. Check-and-notify only: logs the finding, and
@@ -605,14 +1084,15 @@ fn run_update_blocking(check_only: bool) -> Result<(), UpdateError> {
                 env!("CARGO_PKG_VERSION")
             ),
             ApplyOutcome::Applied { tag, path } => {
+                #[cfg(windows)]
+                println!(
+                    "terrustia {tag} downloaded and verified; it will replace {} once this \
+                     process exits. Details are appended to the .update.log beside it.",
+                    path.display()
+                );
+                #[cfg(not(windows))]
                 println!("terrustia updated to {tag}\n  {}", path.display());
             }
-            ApplyOutcome::DownloadedForManualApply { tag, path } => println!(
-                "terrustia {tag} downloaded and verified, but this platform cannot replace its \
-                 own running binary. Stop the server, then move this file over your installed \
-                 terrustia.exe:\n  {}",
-                path.display()
-            ),
         }
     }
     Ok(())
@@ -1090,5 +1570,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The helper is spawned by the parent, so its command line is the only place the relaunch
+    /// context can be captured without another file or another serialization format. This pins
+    /// the fixed positions and the fact that the parent's own arguments follow, unchanged and in
+    /// order, including the flags that carry the config file and panel choice.
+    #[test]
+    fn the_helper_command_line_preserves_the_parents_arguments_in_order() {
+        let relaunch = vec![
+            OsString::from("--config"),
+            OsString::from("C:\\ProgramData\\terrustia.toml"),
+            OsString::from("--panel"),
+        ];
+        let args = helper_command_arguments(
+            4321,
+            Path::new("C:\\game\\staged.exe"),
+            Path::new("C:\\game\\terrustia.exe"),
+            &relaunch,
+        );
+
+        assert_eq!(args[0].to_string_lossy().as_ref(), APPLY_UPDATE_SUBCOMMAND);
+        assert_eq!(args[1].to_string_lossy().as_ref(), "4321");
+        assert_eq!(args[2].to_string_lossy().as_ref(), "C:\\game\\staged.exe");
+        assert_eq!(
+            args[3].to_string_lossy().as_ref(),
+            "C:\\game\\terrustia.exe"
+        );
+        assert_eq!(&args[4..], relaunch.as_slice());
+    }
+
+    #[test]
+    fn the_helper_rejects_a_missing_or_nonsense_command_line() {
+        for bad in [
+            vec![],
+            vec!["42"],
+            vec!["42", "staged.exe"],
+            vec!["not-a-pid", "staged.exe", "target.exe"],
+            vec!["0", "staged.exe", "target.exe"],
+        ] {
+            let args: Vec<OsString> = bad.iter().map(|arg| OsString::from(*arg)).collect();
+            assert!(
+                parse_apply_helper_args(&args).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+
+        let args = vec![
+            OsString::from("42"),
+            OsString::from("staged.exe"),
+            OsString::from("target.exe"),
+            OsString::from("--config"),
+            OsString::from("custom.toml"),
+        ];
+        let parsed = parse_apply_helper_args(&args).expect("a complete command line must parse");
+        assert_eq!(parsed.parent_pid, 42);
+        assert_eq!(parsed.staged, PathBuf::from("staged.exe"));
+        assert_eq!(parsed.target, PathBuf::from("target.exe"));
+        assert_eq!(
+            parsed.relaunch_args,
+            vec![OsString::from("--config"), OsString::from("custom.toml")]
+        );
+    }
+
+    #[test]
+    fn a_successful_replacement_moves_the_staged_file_and_keeps_a_backup_for_cleanup() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let target = dir.path().join("terrustia.exe");
+        let staged = dir.path().join("staged.exe");
+        let backup = dir.path().join("backup.exe");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&staged, b"new binary").unwrap();
+
+        replace_target_with_retries(&target, &staged, &backup, 3, Duration::ZERO)
+            .expect("replacing an unlocked target must succeed");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+        assert!(
+            !staged.exists(),
+            "the staged file is consumed by the rename"
+        );
+        assert!(
+            backup.exists(),
+            "the old file stays at the backup path until the caller removes it"
+        );
+    }
+
+    /// The retry loop's failure path, driven with a real filesystem on every platform: the final
+    /// rename cannot succeed because the staged file is gone, so the old target must be restored
+    /// on every attempt and the error must report that all attempts were used.
+    #[test]
+    fn a_failed_replacement_restores_the_original_after_every_retry() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let target = dir.path().join("terrustia.exe");
+        let staged = dir.path().join("staged.exe");
+        let backup = dir.path().join("backup.exe");
+        std::fs::write(&target, b"old binary").unwrap();
+
+        let error = replace_target_with_retries(&target, &staged, &backup, 3, Duration::ZERO)
+            .expect_err("a missing staged file must not replace anything");
+
+        assert!(
+            error.contains("giving up after 3 attempts"),
+            "the error must say every attempt was used: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"old binary",
+            "the original target must be back in place"
+        );
+        assert!(
+            !backup.exists(),
+            "a successful restore consumes the backup, leaving no stray copy"
+        );
     }
 }

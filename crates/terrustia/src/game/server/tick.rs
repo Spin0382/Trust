@@ -285,6 +285,9 @@ impl GameServer {
             let _ = running.await;
         }
         self.save_world("shutdown");
+        if outcome == Stopped::Cleanly {
+            outcome = self.stop_outcome;
+        }
         info!("game loop stopped");
         outcome
     }

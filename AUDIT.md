@@ -101,8 +101,9 @@ actual `release.yml` run; the two jobs share the same fix but a real tag push ha
 
 ## Open
 
-- Packet coverage: portal-gunning an NPC (100), shop price overrides (104) and the dead-player fade
-  cue (135) are the genuinely missing message ids, out of 163 total. `python3
+- Packet coverage: portal-gunning an NPC (100) and shop price overrides (104) are the genuinely
+  missing message ids, out of 163 total. The dead-player fade cue (135) is now sent from
+  `presence_frames`, so a joining observer sees an already-dead peer. `python3
   tools/packet_audit.py` prints this list rather than anyone maintaining it by hand; spectating
   (150) used to be named here and is host migration, which a dedicated server never does.
 - Server-authoritative inventory and damage validation is not implemented. This is not an oversight

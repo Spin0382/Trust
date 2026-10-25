@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { fetchConfig, setMotd, type ConfigSnapshot } from "./api";
+  import { MAX_MOTD_CHARS, fetchConfig, setMotd, type ConfigSnapshot } from "./api";
 
   let { session }: { session: string } = $props();
 
@@ -9,6 +9,9 @@
   let motdDraft = $state("");
   let saving = $state(false);
   let saved = $state(false);
+  // Counted as Unicode scalar values, matching the backend's `chars().count()` rather than
+  // JavaScript's UTF-16 `.length`.
+  let motdLength = $derived([...motdDraft].length);
 
   async function refresh() {
     try {
@@ -22,7 +25,26 @@
 
   onMount(refresh);
 
+  // The same rules the backend enforces, checked here so an overlong or multi-line draft is not
+  // sent at all. The server stays authoritative: a client-side check is a convenience, not a gate.
+  function validateMotd(value: string): string {
+    const length = [...value].length;
+    if (length > MAX_MOTD_CHARS) {
+      return `the message of the day is limited to ${MAX_MOTD_CHARS} characters; this one is ${length}`;
+    }
+    if (/[\u0000-\u001f\u007f]/.test(value) || /[\u2028\u2029]/.test(value)) {
+      return "the message of the day must be a single line without control characters";
+    }
+    return "";
+  }
+
   async function saveMotd() {
+    const problem = validateMotd(motdDraft);
+    if (problem) {
+      saved = false;
+      error = problem;
+      return;
+    }
     saving = true;
     saved = false;
     try {
@@ -54,12 +76,19 @@
   <section>
     <h3 class="dim">message of the day</h3>
     <p class="dim">
-      the only setting this panel can change live — it is read fresh from the config every time a
-      player joins, so a new value here takes effect for the very next join. everything below is
-      read-only: it reflects the config file and command-line flags the process was started with.
+      this is the one setting the panel can change live: the game task reads it fresh every time a
+      player joins, so a save here applies to the very next join. everything in the grid below is
+      read-only, with the reason beside it. those values are fixed when the process starts or are
+      only read from the config file, so a new value takes a restart.
     </p>
     <form class="motd-form" onsubmit={(e) => { e.preventDefault(); saveMotd(); }}>
-      <input bind:value={motdDraft} oninput={onMotdInput} aria-label="message of the day" />
+      <input
+        bind:value={motdDraft}
+        oninput={onMotdInput}
+        maxlength={MAX_MOTD_CHARS}
+        aria-label="message of the day"
+      />
+      <span class="count">{motdLength}/{MAX_MOTD_CHARS}</span>
       <button disabled={saving}>{saving ? "saving…" : "save"}</button>
     </form>
     {#if saved}<p class="accent-text">saved.</p>{/if}
@@ -69,42 +98,55 @@
     <div class="card">
       <span class="label">listen address</span>
       <span class="value">{config.listen}</span>
+      <span class="hint">read-only: bound when the server starts. change listen and restart.</span>
     </div>
     <div class="card">
       <span class="label">max players</span>
       <span class="value">{config.max_players}</span>
+      <span class="hint">
+        read-only: the player slot table is sized at startup. change max_players and restart.
+      </span>
     </div>
     <div class="card">
       <span class="label">world size</span>
       <span class="value">{config.world_width} × {config.world_height}</span>
+      <span class="hint">read-only: the loaded world's dimensions. switch worlds to change them.</span>
     </div>
     <div class="card">
       <span class="label">password</span>
-      <span class="value">{config.password_set ? "set" : "none — open server"}</span>
+      <span class="value">{config.password_set ? "set" : "none (open server)"}</span>
+      <span class="hint">
+        read-only: set or clear password in the config and restart. the value is never shown here.
+      </span>
     </div>
     <div class="card">
       <span class="label">max chat length</span>
       <span class="value">{config.max_chat_len}</span>
+      <span class="hint">read-only: change max_chat_len and restart.</span>
     </div>
     <div class="card">
       <span class="label">idle timeout</span>
       <span class="value">{config.idle_timeout_secs}s</span>
+      <span class="hint">read-only: change idle_timeout_secs and restart.</span>
     </div>
     <div class="card">
       <span class="label">autosave</span>
       <span class="value">
         {config.autosave_secs > 0 ? `every ${config.autosave_secs}s` : "disabled"}
       </span>
+      <span class="hint">read-only: change autosave_secs and restart.</span>
     </div>
     <div class="card">
       <span class="label">save destination</span>
-      <span class="value small">{config.save_target ?? "none — this world will not be saved"}</span>
+      <span class="value small">{config.save_target ?? "none (this world will not be saved)"}</span>
+      <span class="hint">read-only: the world file is opened at startup. use the worlds tab to switch.</span>
     </div>
     <div class="card">
       <span class="label">whitelist</span>
       <span class="value">
         {config.whitelist_on ? `on (${config.whitelist_count})` : "off"}
       </span>
+      <span class="hint">managed live on the whitelist tab.</span>
     </div>
   </section>
 {:else}
@@ -139,12 +181,19 @@
 
   .motd-form {
     display: flex;
+    align-items: center;
     gap: 0.5rem;
-    max-width: 520px;
+    max-width: 640px;
   }
 
   .motd-form input {
     flex: 1;
+  }
+
+  .count {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    white-space: nowrap;
   }
 
   .grid {
@@ -178,5 +227,11 @@
 
   .value.small {
     font-size: 0.82rem;
+  }
+
+  .hint {
+    font-size: 0.76rem;
+    line-height: 1.35;
+    color: var(--text-dim);
   }
 </style>

@@ -93,10 +93,13 @@ pub enum TileColor {
 #[derive(Debug, Clone)]
 pub struct PanelConfigSnapshot {
     pub listen: SocketAddr,
+    /// The limit the process started with. The player slot table is sized from this value once, in
+    /// `GameServer::new`, so the panel shows it read-only: changing it takes a restart.
     pub max_players: usize,
     pub world_width: i32,
     pub world_height: i32,
     pub motd: String,
+    /// Whether the shared join password is set. Never the value itself.
     pub password_set: bool,
     pub max_chat_len: usize,
     pub idle_timeout_secs: u64,

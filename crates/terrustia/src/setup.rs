@@ -21,10 +21,23 @@
 
 use std::{
     io::{self, IsTerminal, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
 use crate::config::Config;
+
+/// Terraria's three world-size presets, in tiles. Small is this project's default (and the game's
+/// own default in `terrustia.toml.example`); Medium and Large are vanilla's other two sizes. All
+/// three are whole numbers of 200x150 sections, which is what [`Config::validate`] requires of a
+/// generated world. The Large preset is the one `docs/performance.md` measures against a real
+/// 8400x2400 world.
+const WORLD_SIZE_SMALL: (i32, i32) = (
+    crate::world::worldgen::SMALL_WIDTH,
+    crate::world::worldgen::SMALL_HEIGHT,
+);
+const WORLD_SIZE_MEDIUM: (i32, i32) = (6400, 1800);
+const WORLD_SIZE_LARGE: (i32, i32) = (8400, 2400);
 
 /// Whether a plain, zero-flag `terrustia` invocation should offer the wizard instead of falling
 /// through to the ordinary non-interactive default (generate an ephemeral world, serve it).
@@ -136,6 +149,18 @@ pub fn run_wizard() -> Result<PathBuf, WizardError> {
         true,
     )?;
 
+    // Every default below is read from one Config::default(), so a plain Enter in the wizard and
+    // the zero-flag path choose the same values.
+    let defaults = Config::default();
+    let world_size = prompt_world_size((defaults.world_width, defaults.world_height))?;
+    let seed = prompt_seed(defaults.seed)?;
+    let listen = prompt_listen(defaults.listen)?;
+    let password = prompt("Server password (empty leaves the server open)", "")?;
+    let autosave_secs = prompt_u64(
+        "Autosave interval in seconds (0 disables automatic saves)",
+        defaults.autosave_secs,
+    )?;
+
     let world_path = crate::worlds::new_world_path(&world_name).map_err(WizardError::Invalid)?;
     if let Some(parent) = world_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -154,8 +179,20 @@ pub fn run_wizard() -> Result<PathBuf, WizardError> {
         save_file: Some(world_path.clone()),
         max_players,
         panel_enabled,
-        ..Config::default()
+        world_width: world_size.0,
+        world_height: world_size.1,
+        seed,
+        listen,
+        password,
+        autosave_secs,
+        ..defaults
     };
+    // The prompts already apply the same rules one at a time, but the real check is the same
+    // `Config::validate` every other entry point runs, against the final combination rather than
+    // against each answer in isolation.
+    config
+        .validate()
+        .map_err(|e| WizardError::Invalid(e.to_string()))?;
     let config_path = dir.join("terrustia.toml");
     write_config(&config_path, &config)?;
 
@@ -169,6 +206,140 @@ pub fn run_wizard() -> Result<PathBuf, WizardError> {
     println!();
 
     Ok(config_path)
+}
+
+/// The user-facing label for a size, when it is one of the presets the prompt offers. A custom
+/// `WIDTHxHEIGHT` default falls back to showing its dimensions instead.
+fn world_size_name(size: (i32, i32)) -> Option<&'static str> {
+    if size == WORLD_SIZE_SMALL {
+        Some("small")
+    } else if size == WORLD_SIZE_MEDIUM {
+        Some("medium")
+    } else if size == WORLD_SIZE_LARGE {
+        Some("large")
+    } else {
+        None
+    }
+}
+
+fn prompt_world_size(default: (i32, i32)) -> Result<(i32, i32), WizardError> {
+    let fallback = world_size_name(default)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}x{}", default.0, default.1));
+    loop {
+        let value = prompt(
+            "World size (small, medium, large, or WIDTHxHEIGHT in tiles)",
+            &fallback,
+        )?;
+        let size = match parse_world_size(&value) {
+            Ok(size) => size,
+            Err(message) => {
+                println!("{message}");
+                continue;
+            }
+        };
+        if let Err(message) = validate_world_size(size) {
+            println!("{message}");
+            continue;
+        }
+        return Ok(size);
+    }
+}
+
+/// Preset names, their 1-based menu positions, and `WIDTHxHEIGHT` all resolve here. Anything that
+/// parses still goes through [`Config::validate`] before it is accepted, so this does not grow a
+/// second, looser copy of the size rules.
+fn parse_world_size(value: &str) -> Result<(i32, i32), String> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "small" | "s" | "1" => Ok(WORLD_SIZE_SMALL),
+        "medium" | "m" | "2" => Ok(WORLD_SIZE_MEDIUM),
+        "large" | "l" | "3" => Ok(WORLD_SIZE_LARGE),
+        _ => {
+            let Some((width, height)) = value.split_once('x') else {
+                return Err(
+                    "please choose small, medium or large, or give a size like 6400x1800".into(),
+                );
+            };
+            let width = width
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| "world width must be a whole number of tiles".to_string())?;
+            let height = height
+                .trim()
+                .parse::<i32>()
+                .map_err(|_| "world height must be a whole number of tiles".to_string())?;
+            Ok((width, height))
+        }
+    }
+}
+
+/// The same `Config::validate` a config file gets, applied to one candidate size. A generated
+/// world has no `world_file`, so the size checks in `validate` are the ones that run.
+fn validate_world_size(size: (i32, i32)) -> Result<(), String> {
+    Config {
+        world_width: size.0,
+        world_height: size.1,
+        ..Config::default()
+    }
+    .validate()
+    .map_err(|e| e.to_string())
+}
+
+/// A seed is any text, exactly as `--seed` accepts it: a plain number reproduces that number, and
+/// anything else is hashed into one (see `worldgen::secret_seed::numeric_seed`). This writes the
+/// resulting number to `seed`, so a text seed typed here reproduces the same generated world as a
+/// later `--seed` with the same text. Vanilla's secret-seed names are only recognised on `--seed`
+/// itself, which is why a non-numeric answer gets a note.
+fn prompt_seed(default: u64) -> Result<u64, WizardError> {
+    let value = prompt(
+        "World seed (a number, or any text, which is hashed; empty for 0)",
+        &default.to_string(),
+    )?;
+    if let Ok(seed) = value.parse::<u64>() {
+        return Ok(seed);
+    }
+    println!(
+        "note: text seeds are hashed into a number here; vanilla's secret-seed names (for \
+         example \"for the worthy\") are only recognised by --seed on the command line"
+    );
+    Ok(crate::world::worldgen::secret_seed::numeric_seed(&value))
+}
+
+fn prompt_listen(default: SocketAddr) -> Result<SocketAddr, WizardError> {
+    loop {
+        let value = prompt(
+            "Listen address (IP:port, or just a port on the default address)",
+            &default.to_string(),
+        )?;
+        match parse_listen(&value, default) {
+            Ok(addr) => return Ok(addr),
+            Err(message) => println!("{message}"),
+        }
+    }
+}
+
+fn parse_listen(value: &str, default: SocketAddr) -> Result<SocketAddr, String> {
+    let value = value.trim();
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    // A bare port is the common answer to "what port should this listen on", and it keeps the
+    // address `Config::default` chose rather than inventing a second default.
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(SocketAddr::new(default.ip(), port));
+    }
+    Err("please enter an address like 0.0.0.0:7777, or a port like 7777".into())
+}
+
+fn prompt_u64(question: &str, default: u64) -> Result<u64, WizardError> {
+    loop {
+        let value = prompt(question, &default.to_string())?;
+        match value.parse::<u64>() {
+            Ok(n) => return Ok(n),
+            Err(_) => println!("please enter a whole number, 0 or greater"),
+        }
+    }
 }
 
 fn default_dedicated_dir() -> PathBuf {
@@ -221,6 +392,12 @@ fn write_config(path: &Path, config: &Config) -> Result<(), WizardError> {
     ));
     out.push_str(&format!("max_players = {}\n", config.max_players));
     out.push_str(&format!("panel_enabled = {}\n", config.panel_enabled));
+    out.push_str(&format!("world_width = {}\n", config.world_width));
+    out.push_str(&format!("world_height = {}\n", config.world_height));
+    out.push_str(&format!("seed = {}\n", config.seed));
+    out.push_str(&format!("listen = \"{}\"\n", config.listen));
+    out.push_str(&format!("password = {:?}\n", config.password));
+    out.push_str(&format!("autosave_secs = {}\n", config.autosave_secs));
     // Through the same temp-file-and-rename every other writer here uses. The wizard writes into a
     // directory it has just checked is empty, so there is rarely a previous file to protect - but
     // `--setup` re-run against an existing install is a supported thing to do, and a half-written
@@ -345,11 +522,18 @@ mod tests {
             std::env::temp_dir().join(format!("terrustia-setup-test-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("terrustia.toml");
+        let listen: SocketAddr = "127.0.0.1:7789".parse().unwrap();
         let config = Config {
             world_name: "A Test World".to_string(),
             save_file: Some(dir.join("A_Test_World.wld")),
             max_players: 16,
             panel_enabled: true,
+            world_width: WORLD_SIZE_MEDIUM.0,
+            world_height: WORLD_SIZE_MEDIUM.1,
+            seed: 424_242,
+            listen,
+            password: "s3cret pass".to_string(),
+            autosave_secs: 45,
             ..Config::default()
         };
         write_config(&config_path, &config).unwrap();
@@ -359,10 +543,59 @@ mod tests {
         assert_eq!(loaded.save_file, config.save_file);
         assert_eq!(loaded.max_players, 16);
         assert!(loaded.panel_enabled);
-        // Everything the wizard did not ask about keeps its ordinary default.
-        assert_eq!(loaded.autosave_secs, Config::default().autosave_secs);
+        assert_eq!(loaded.world_width, WORLD_SIZE_MEDIUM.0);
+        assert_eq!(loaded.world_height, WORLD_SIZE_MEDIUM.1);
+        assert_eq!(loaded.seed, 424_242);
+        assert_eq!(loaded.listen, listen);
+        assert_eq!(loaded.password, "s3cret pass");
+        assert_eq!(loaded.autosave_secs, 45);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every preset the size prompt offers must satisfy the same `Config::validate` a hand-written
+    /// `terrustia.toml` gets, or the wizard could write a config the server refuses at boot.
+    #[test]
+    fn every_world_size_preset_passes_the_config_validation() {
+        for size in [WORLD_SIZE_SMALL, WORLD_SIZE_MEDIUM, WORLD_SIZE_LARGE] {
+            validate_world_size(size).unwrap_or_else(|e| {
+                panic!("{size:?} is offered by the wizard but rejected by Config: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn world_size_input_accepts_names_menu_numbers_and_dimensions() {
+        assert_eq!(parse_world_size("small").unwrap(), WORLD_SIZE_SMALL);
+        assert_eq!(parse_world_size("M").unwrap(), WORLD_SIZE_MEDIUM);
+        assert_eq!(parse_world_size("3").unwrap(), WORLD_SIZE_LARGE);
+        assert_eq!(parse_world_size("6400X1800").unwrap(), WORLD_SIZE_MEDIUM);
+        assert_eq!(parse_world_size("400x300").unwrap(), (400, 300));
+        assert!(parse_world_size("large please").is_err());
+        // Parsing is not enough; the same size rules `Config::validate` applies still run.
+        assert!(validate_world_size((399, 300)).is_err());
+        assert!(validate_world_size((401, 300)).is_err());
+        assert!(validate_world_size((400, 299)).is_err());
+        assert!(validate_world_size((400, 300)).is_ok());
+        assert!(validate_world_size((i32::from(i16::MAX) + 1, 300)).is_err());
+    }
+
+    #[test]
+    fn listen_input_accepts_an_address_or_a_bare_port() {
+        let default: SocketAddr = "0.0.0.0:7777".parse().unwrap();
+        assert_eq!(
+            parse_listen("127.0.0.1:1234", default).unwrap(),
+            "127.0.0.1:1234".parse().unwrap()
+        );
+        assert_eq!(
+            parse_listen("1234", default).unwrap(),
+            "0.0.0.0:1234".parse().unwrap(),
+            "a bare port keeps the default address"
+        );
+        assert_eq!(parse_listen("0", default).unwrap().port(), 0);
+        assert!(parse_listen("localhost:1234", default).is_err());
+        assert!(parse_listen("70000", default).is_err());
+        assert!(parse_listen("", default).is_err());
     }
 
     /// A config the wizard cannot write must be refused out loud, with the previous one intact.

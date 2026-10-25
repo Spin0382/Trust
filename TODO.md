@@ -723,15 +723,14 @@ against a table of 120 and no override), the Queen Slime's smash (600 against an
 expires; `Projectile.Kill`'s own switch widens the hitbox and breaks tiles, so a grenade lands and
 does nothing where vanilla's takes a hole out of the wall.
 
-**Boulder *tiles* release nothing when mined, and the blocker is not the projectile.**
-`WorldGen.KillTile`'s own switch (`WorldGen.cs:49177-49212`) is eleven cases, ten of them the
-boulder family this generator already scatters into trap chambers, and mining one gives back the
-item and no boulder. The hook has nowhere correct to sit yet: vanilla finds the object's anchor from
-`frameX/18`, and this generator places a boulder as **one unframed tile** rather than a framed 2x2
-(`traps.rs:621` passes `-1, -1`), because there is no `TileObjectData`-driven placement and no
-`Check2x2`/`SquareTileFrame` anywhere in this server. Building the hook on that would fire a
-projectile per reported tile from an anchor that does not exist. The prerequisite is multi-tile
-framing, which `dispatch.rs`'s own `frame_important` arm already names as absent.
+**Boulder *tiles* now clear their framed 2x2 and drop one item when mined; the rolling
+projectile is still missing.** Fixed 2026-10-25: `traps.rs` places the boulder with
+`place_object` at its own `(0, 1)` origin, and `dispatch.rs` resolves any hit cell back to the
+anchor with `tile_object::origin_of`, requires all four cells to frame as one object, clears them
+together (preserving each wall, wall colour and liquid), logs each cell for `/world undo`, and
+drops the boulder's item exactly once. The part that remains is the projectile vanilla launches
+when the object is freed: `WorldGen.KillTile`'s switch (`WorldGen.cs:49177-49212`) still has no
+counterpart here, so the boulder breaks and drops rather than rolling.
 
 ### Lane D: protocol classification, zero unknown IDs (done)
 

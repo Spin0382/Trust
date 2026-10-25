@@ -9178,6 +9178,19 @@ impl GameServer {
         self.broadcast_invasion_progress();
     }
 
+    /// `NPC.AnyDanger()` (`NPC.cs:81063-81106`): whether the world is dangerous enough that
+    /// ambient spawns should hold off.
+    ///
+    /// The invasion half is decided by the caller, which returns before this is built while an
+    /// invasion runs. The Moon Lord's countdown counts for the whole 3,600 ticks after the last
+    /// pillar falls (`NPC.cs:81066`), not only once the boss itself is alive.
+    fn any_danger(&self) -> bool {
+        self.lunar.countdown > 0
+            || self.moon.running()
+            || self.army.ongoing()
+            || self.npcs.iter().any(|(_, n)| n.stats.boss && n.is_alive())
+    }
+
     /// Try to spawn new NPCs around the players.
     pub(super) fn tick_spawning(&mut self) {
         if self.ticks.is_multiple_of(300) {
@@ -9252,13 +9265,11 @@ impl GameServer {
                 && progress.downed_mech3,
             // Three of an event's heavies at once is as many as it will put out.
             boss_cap: self.npcs.iter().filter(|(_, n)| n.stats.boss).count() >= 3,
-            // `NPC.AnyDanger()` (`NPC.cs:81063-81106`). The invasion half is already decided: this
-            // function returns above if one is running, so reaching here means there is none. The
-            // Moon Lord's countdown is not modelled as a countdown, but the fight itself is a live
-            // boss and so is caught by the same test that catches every other one.
-            any_danger: self.moon.running()
-                || self.army.ongoing()
-                || self.npcs.iter().any(|(_, n)| n.stats.boss && n.is_alive()),
+            // `NPC.AnyDanger()` (`NPC.cs:81063-81106`). The invasion half is already decided:
+            // this function returns above if one is running, so reaching here means there is none.
+            // The helper also counts the Moon Lord's countdown, which vanilla treats as danger
+            // for the whole post-pillar window rather than only once the boss is alive.
+            any_danger: self.any_danger(),
             census: &count,
             cavern_monsters: self.cavern_monsters,
             // Where the four pillars are, gathered once a tick and only while the event is up, so
@@ -9446,6 +9457,102 @@ impl GameServer {
                 self.send(slot, frame);
             }
         }
+    }
+
+    /// `TileID.Sets.Boulders`: every member is one framed 2x2 `TileObjectData` object.
+    const BOULDERS: [u16; 10] = [138, 484, 664, 665, 711, 712, 713, 714, 715, 716];
+
+    /// The four cells of one complete framed boulder, top-left first, or `None` when `(x, y)` is
+    /// not part of one.
+    ///
+    /// `origin_of` walks any cell back to its top-left; this then requires every cell of the
+    /// footprint to be the same boulder type and to frame at its own offset in that object. That
+    /// second half is what separates a real 2x2 object from a legacy unframed boulder (frames of
+    /// -1, which `origin_of` cannot place) or a half-cleared one. The caller falls back to the
+    /// ordinary single-tile path for both.
+    fn boulder_footprint(&self, x: i32, y: i32, tile: Tile) -> Option<[(i32, i32, Tile); 4]> {
+        if !tile.is_active() || !Self::BOULDERS.contains(&tile.block) {
+            return None;
+        }
+        // A legacy unframed boulder has frames of -1; `origin_of` would read those as (0, 0) and
+        // invent a footprint that is not there.
+        if tile.frame_x < 0 || tile.frame_y < 0 {
+            return None;
+        }
+        let object = terrustia_proto::tile_object::tile_object(tile.block)?;
+        if object.width != 2 || object.height != 2 {
+            return None;
+        }
+        let (dx, dy) =
+            terrustia_proto::tile_object::origin_of(tile.block, tile.frame_x, tile.frame_y)?;
+        let (left, top) = (x - dx, y - dy);
+        let mut cells = [(0, 0, Tile::AIR); 4];
+        for cy in 0..2 {
+            for cx in 0..2 {
+                let (tx, ty) = (left + cx, top + cy);
+                let cell = self.world.tile(tx, ty);
+                if !cell.is_active() || cell.block != tile.block {
+                    return None;
+                }
+                // Every cell has to be framed, not just the one that was hit: an unframed
+                // top-left would otherwise pass the (0, 0) offset check below.
+                if cell.frame_x < 0 || cell.frame_y < 0 {
+                    return None;
+                }
+                if terrustia_proto::tile_object::origin_of(cell.block, cell.frame_x, cell.frame_y)
+                    != Some((cx, cy))
+                {
+                    return None;
+                }
+                cells[(cy * 2 + cx) as usize] = (tx, ty, cell);
+            }
+        }
+        Some(cells)
+    }
+
+    /// Mine a framed boulder when any one of its four cells is broken.
+    ///
+    /// A boulder is one framed 2x2 object: clearing the single cell the pickaxe hit would leave
+    /// the other three standing as a corrupt object. This resolves and verifies the whole
+    /// footprint first, clears all four together (keeping each cell's wall, wall colour and liquid,
+    /// exactly as the ordinary kill path does), logs every cleared cell for `/world undo`, and
+    /// drops one item at the cell the player actually hit. Returns false without touching anything
+    /// when `(x, y)` is not a complete framed boulder, so a legacy unframed one keeps the
+    /// single-cell behaviour and drops only its item.
+    ///
+    /// The rolling projectile vanilla launches when a boulder is freed is deliberately not
+    /// modelled here yet; this is the release and drop only.
+    pub(super) fn mine_framed_boulder(
+        &mut self,
+        slot: u8,
+        x: i32,
+        y: i32,
+        tile: Tile,
+        drops_item: bool,
+    ) -> bool {
+        let Some(cells) = self.boulder_footprint(x, y, tile) else {
+            return false;
+        };
+        let player = self.player(slot).map(|p| p.name.clone());
+        for &(cx, cy, before) in &cells {
+            let mut cleared = before;
+            cleared.block = 0;
+            cleared.frame_x = -1;
+            cleared.frame_y = -1;
+            cleared.slope = 0;
+            cleared.flags.set(TileFlags::ACTIVE, false);
+            cleared.flags.set(TileFlags::HALF_BRICK, false);
+            self.world.set_tile(cx, cy, cleared);
+            // Mining a block is the commonest way liquid starts moving.
+            self.liquids.disturb(cx, cy);
+            if let Some(name) = &player {
+                self.tile_log.record(cx, cy, before, name);
+            }
+        }
+        if drops_item {
+            self.spawn_tile_drop(tile.block, tile.frame_x, tile.frame_y, x, y);
+        }
+        true
     }
 
     /// Drop whatever a broken tile yields, if it is a block with a simple drop.
@@ -10154,6 +10261,35 @@ mod lunar_pillar_fight {
         // The seventh finds the swarm at twenty-one and leaves nothing.
         kill(&mut server, 426);
         assert_eq!(alive(&server, 428), 18, "the swarm is capped at twenty");
+    }
+}
+
+#[cfg(test)]
+mod any_danger_includes_the_moon_lord_countdown {
+    use super::*;
+    use crate::config::Config;
+
+    /// `NPC.AnyDanger` opens with `MoonLordCountdown > 0` (`NPC.cs:81066`), so the 3,600 ticks
+    /// between the last pillar and the Moon Lord are still danger. Before this, the countdown
+    /// existed but nothing read it here, and ambient spawning carried on through the window as if
+    /// the boss were not coming.
+    #[test]
+    fn the_moon_lord_countdown_counts_as_danger() {
+        let world = crate::world::World::empty(400, 300, "any danger probe");
+        let mut server = GameServer::new(Config::default(), world);
+        assert!(!server.any_danger(), "a fresh world is not in danger");
+
+        server.lunar.countdown = 3_600;
+        assert!(
+            server.any_danger(),
+            "the post-pillar countdown must hold ambient spawns off"
+        );
+
+        server.lunar.countdown = 0;
+        assert!(
+            !server.any_danger(),
+            "once the countdown is over, only a live boss or event keeps the gate closed"
+        );
     }
 }
 

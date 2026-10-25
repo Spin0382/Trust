@@ -8,8 +8,9 @@
 //! closes; and the full admin feature set: a player list with kick/ban, whitelist
 //! management, world switching (a real graceful process restart — see
 //! [`crate::game::server::GameServer::pending_world_switch`]'s doc comment for why that is the
-//! honest answer rather than a hot-swap), a read-only settings view with the few fields that are
-//! genuinely safe to change live, and a stylized, procedural live world view (see
+//! honest answer rather than a hot-swap), a settings view whose one live-editable field is the
+//! MOTD (the game task reads it fresh on every join; see [`settings`]), and a stylized, procedural
+//! live world view (see
 //! `crates/terrustia/web-panel/src/lib/WorldView.svelte` for the rendering side, and
 //! [`worlds::world_ws_upgrade`] for the data it draws from  -  real positions and appearance data,
 //! real tile types, never a composited Terraria sprite).
@@ -79,6 +80,14 @@
 //! | `/api/accounts/group` | `admin.accounts`, plus an anti-escalation reach check (see `Admin::group_within_reach`) |
 //! | `/api/permissions`, `/api/groups/permissions` | `admin.groups`, the group-permission-set editor — plus, for a grant, the same reach check |
 //! | `/api/audit` | `admin.audit` |
+//!
+//! The rest of the settings view is read-only on purpose, and the panel says so beside each value.
+//! The listen socket, the loaded world and the player slot table are all fixed when the process
+//! starts, and there is no game-task event for changing the shared join password, so an input for
+//! any of them would promise a live change this process cannot make. A new value takes a restart
+//! with the config file. Only the MOTD is written live: the game task reads it fresh on every join.
+//! An unknown `/api/...` path answers `404` rather than the SPA shell, so a typo or a field this
+//! build does not expose fails visibly instead of looking like a successful save.
 //!
 //! Kick, ban, whitelist and console/chat commands sent from the panel reuse `run_admin_command`'s
 //! own logic, or (for raw console/chat lines) `ServerEvent::Console` itself, the very channel the
@@ -377,6 +386,12 @@ pub async fn supervise(
 
 async fn static_handler(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
+    // Only client-side routes get the SPA shell. An unknown `/api/...` path is a missing endpoint
+    // and has to say so: a settings form that posts to a field this build does not expose must fail
+    // visibly, not receive `200 OK` with `index.html` and look as if the change was applied.
+    if path == "api" || path.starts_with("api/") {
+        return err(StatusCode::NOT_FOUND, "no such API endpoint");
+    }
     let path = if path.is_empty() { "index.html" } else { path };
     if let Some(body) = load_static_asset(path) {
         return ([(header::CONTENT_TYPE, content_type_for(path))], body).into_response();

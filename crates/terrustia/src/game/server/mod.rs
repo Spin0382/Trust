@@ -991,6 +991,24 @@ pub enum Stopped {
     Cleanly,
     /// Something panicked. The world was still saved on the way out.
     Panicked,
+    /// A world backup was restored. The world was not saved again, and the process should exit
+    /// non-zero so a supervisor reloads the restored file in a fresh process.
+    RolledBack,
+}
+
+impl Stopped {
+    /// The process exit code this outcome maps to.
+    ///
+    /// 75 is `EX_TEMPFAIL`, which systemd's `Restart=on-failure` and container policies keyed on
+    /// exit status treat as a failure. A rollback is a deliberate stop, but it must not stay down:
+    /// the restored world is only loaded on the next start.
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Cleanly => 0,
+            Self::RolledBack => 75,
+            Self::Panicked => 1,
+        }
+    }
 }
 
 pub struct GameServer {
@@ -1198,6 +1216,8 @@ pub struct GameServer {
     audit: crate::admin::AuditLog,
     /// Set by the console's `stop`, so the loop ends and the world is saved on the way out.
     stopping: bool,
+    /// How the loop should report its stop. `Cleanly` unless a rollback asks for a restart.
+    stop_outcome: Stopped,
     worst_tick: TickCost,
     /// The cheapest and dearest tick since the status footer last drew, about a second's worth.
     ///
@@ -1406,6 +1426,7 @@ impl GameServer {
                 None => crate::admin::AuditLog::in_memory(),
             },
             stopping: false,
+            stop_outcome: Stopped::Cleanly,
             worst_tick: TickCost::default(),
             status_span: (Duration::MAX, Duration::ZERO),
             worst_stall: Duration::ZERO,
@@ -2239,6 +2260,7 @@ impl GameServer {
         // The in-memory world must not be written over what was just restored.
         self.save_path = None;
         self.stopping = true;
+        self.stop_outcome = Stopped::RolledBack;
         Ok(format!(
             "rolled back to backup #{which}; the server is stopping so it loads cleanly on the \
              next start"
@@ -3360,6 +3382,64 @@ mod panic_path {
         let server = GameServer::new(Config::default(), tiny_world());
         drop(tx);
         assert_eq!(server.run(rx).await, Stopped::Cleanly);
+    }
+}
+
+/// A rollback restores a backup and stops, but a clean exit would leave a supervisor with
+/// `Restart=on-failure` treating the restored world as "the operator asked to stop". The process
+/// has to report a failure so a fresh process loads the restored file.
+#[cfg(test)]
+mod rollback_exit {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn a_successful_rollback_reports_that_a_restart_is_needed() {
+        let dir = crate::safe_write::tests::temp_dir("rollback-exit");
+        let path = dir.join("world.wld");
+        let bytes = crate::world::wld_save::serialize(&crate::world::worldgen::generate(
+            200,
+            150,
+            "rollback probe",
+            1,
+        ))
+        .expect("serialize");
+        std::fs::write(&path, &bytes).expect("write the current world");
+        std::fs::write(path.with_extension("wld.bak1"), &bytes).expect("write backup 1");
+
+        let config = Config {
+            save_file: Some(path),
+            ..Config::default()
+        };
+        let mut server = GameServer::new(
+            config,
+            crate::world::worldgen::generate(200, 150, "rollback probe", 1),
+        );
+
+        let message = server.roll_back(1).expect("rollback should succeed");
+        assert!(
+            message.contains("stopping"),
+            "unexpected message: {message}"
+        );
+        assert!(server.stopping, "a rollback stops the loop");
+        assert_eq!(
+            server.stop_outcome,
+            Stopped::RolledBack,
+            "the process must ask the supervisor to restart"
+        );
+        assert!(
+            server.save_path.is_none(),
+            "the in-memory world must not overwrite the restored file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exit_codes_distinguish_a_rollback_from_a_clean_stop() {
+        assert_eq!(Stopped::Cleanly.exit_code(), 0);
+        assert_eq!(Stopped::RolledBack.exit_code(), 75);
+        assert_eq!(Stopped::Panicked.exit_code(), 1);
     }
 }
 

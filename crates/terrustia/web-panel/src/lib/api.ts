@@ -338,6 +338,10 @@ export async function fetchConfig(session: string): Promise<ConfigSnapshot> {
   return getJson<ConfigSnapshot>("/api/config", session);
 }
 
+/** The stock chat-line ceiling, matching the backend's own MOTD limit. The server is authoritative;
+ *  this only stops an overlong draft being sent in the first place. */
+export const MAX_MOTD_CHARS = 500;
+
 export async function setMotd(session: string, motd: string): Promise<void> {
   await postJson("/api/config/motd", session, { motd });
 }
