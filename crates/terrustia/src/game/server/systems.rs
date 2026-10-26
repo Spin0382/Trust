@@ -6186,8 +6186,6 @@ impl GameServer {
     /// anchor, then a still boulder (projectile 99, 70 damage, 10 knockback) dropped from the middle
     /// of its base, twenty-eight pixels down.
     fn fire_boulder_statue(&mut self, x: i32, y: i32) {
-        /// `ProjectileID.Boulder`.
-        const BOULDER: u16 = 99;
         /// `CheckMech(num90, num91, 900)` - fifteen seconds between boulders.
         const BOULDER_COOLDOWN: i32 = 900;
 
@@ -6198,9 +6196,9 @@ impl GameServer {
         // same reason: the statue has gone off, and should not retry every tick.
         self.mech_cooldown.insert((x, y), BOULDER_COOLDOWN);
         let position = ((x + 1) as f32 * 16.0, y as f32 * 16.0 + 28.0);
-        if let Some(index) = self
-            .projectiles
-            .launch(BOULDER, position, (0.0, 0.0), 70, 0)
+        if let Some(index) =
+            self.projectiles
+                .launch(Self::BOULDER_PROJECTILE, position, (0.0, 0.0), 70, 0)
         {
             self.broadcast_projectile(index);
         }
@@ -9191,6 +9189,27 @@ impl GameServer {
             || self.npcs.iter().any(|(_, n)| n.stats.boss && n.is_alive())
     }
 
+    /// Drop unsupported falling tiles after an edit, the way `TileFrame` does
+    /// (`WorldGen.cs:82665`). The world-update sample alone can leave a mined sand ceiling
+    /// floating for minutes; an edit is the moment vanilla actually runs the check.
+    pub(super) fn settle_falling_sand_after_edit(&mut self, x: i32, y: i32) {
+        let mut changed = Vec::new();
+        let x0 = (x - 1).max(1);
+        let x1 = (x + 1).min(self.world.width() - 2);
+        let y1 = y.min(self.world.height() - 2);
+        for cx in x0..=x1 {
+            // Top-down: a run moves as one, and every lower position is then already empty.
+            for cy in (1..=y1).rev() {
+                crate::world::growth::fall_sand(&mut self.world, cx, cy, &mut changed);
+            }
+        }
+        changed.sort_unstable();
+        changed.dedup();
+        for (cx, cy) in changed {
+            self.broadcast_tile(cx, cy);
+        }
+    }
+
     /// Try to spawn new NPCs around the players.
     pub(super) fn tick_spawning(&mut self) {
         if self.ticks.is_multiple_of(300) {
@@ -9462,6 +9481,9 @@ impl GameServer {
     /// `TileID.Sets.Boulders`: every member is one framed 2x2 `TileObjectData` object.
     const BOULDERS: [u16; 10] = [138, 484, 664, 665, 711, 712, 713, 714, 715, 716];
 
+    /// `ProjectileID.Boulder`, what a freed boulder tile becomes.
+    const BOULDER_PROJECTILE: u16 = 99;
+
     /// The four cells of one complete framed boulder, top-left first, or `None` when `(x, y)` is
     /// not part of one.
     ///
@@ -9551,6 +9573,21 @@ impl GameServer {
         }
         if drops_item {
             self.spawn_tile_drop(tile.block, tile.frame_x, tile.frame_y, x, y);
+        }
+        // A freed boulder is not only an item. `WorldGen.KillTile`'s own switch
+        // (`WorldGen.cs:50097`, `case 138`) launches `ProjectileID.Boulder` from the middle of the
+        // object at rest, and the projectile's own arm gives it its gravity; without this a mined
+        // boulder broke and dropped instead of rolling. The position is vanilla's arithmetic on
+        // the object's top-left cell, `x * 16 + 15.5` and `y * 16 + 16`, which is the centre of
+        // the 2x2. It fires even when the tile drops nothing, because vanilla's switch sits after
+        // the item block and is not gated on it.
+        let (ox, oy) = (cells[0].0, cells[0].1);
+        let position = (ox as f32 * 16.0 + 15.5, oy as f32 * 16.0 + 16.0);
+        if let Some(index) =
+            self.projectiles
+                .launch(Self::BOULDER_PROJECTILE, position, (0.0, 0.0), 70, 0)
+        {
+            self.broadcast_projectile(index);
         }
         true
     }

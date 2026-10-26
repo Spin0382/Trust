@@ -2288,6 +2288,7 @@ impl GameServer {
         // tile's whole state — not just the field this particular edit happened to change.
         let before = tile;
         let mut changed = true;
+        let mut world_changed = false;
         let mut broke = None;
 
         match edit.kind() {
@@ -2303,6 +2304,7 @@ impl GameServer {
                     if section_owned && self.mine_framed_boulder(slot, x, y, tile, drops_item) {
                         // Every cell, the tile log and the drop have already been handled.
                         changed = false;
+                        world_changed = true;
                     } else {
                         if tile.is_active() && drops_item {
                             // The frames go with the block. Everything that decides what a broken
@@ -2383,6 +2385,7 @@ impl GameServer {
             if let Some(name) = self.player(slot).map(|p| p.name.clone()) {
                 self.tile_log.record(x, y, before, &name);
             }
+            world_changed = true;
         }
         // Gated on `section_owned`, not `changed`: a rejected edit still leaves `broke` set to
         // whatever the match arm above decided a real kill would drop, and applying these side
@@ -2410,6 +2413,9 @@ impl GameServer {
             if block == BEE_LARVA {
                 self.wake_from_tile(x, y, QUEEN_BEE);
             }
+        }
+        if section_owned && world_changed {
+            self.settle_falling_sand_after_edit(x, y);
         }
 
         // Relay regardless: even an edit the server does not model must reach other clients, or
@@ -8238,6 +8244,51 @@ mod player_luck {
 }
 
 #[cfg(test)]
+mod falling_sand_after_edit {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn mining_the_support_under_sand_drops_it_immediately() {
+        let mut world = crate::world::World::empty(200, 150, "sand trigger probe");
+        world.set_tile(100, 100, Tile::block(53));
+        world.set_tile(100, 101, Tile::block(1));
+        world.set_tile(100, 102, Tile::block(1));
+
+        let mut server = GameServer::new(Config::default(), world);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().expect("test address"), tx);
+        player.state = ConnState::Playing;
+        player
+            .sent_sections
+            .insert(server.world.section_of(100, 100));
+        server.players[0] = Some(player);
+
+        let edit = TileManipulation {
+            action: 0,
+            x: 100,
+            y: 101,
+            arg: 0,
+            style: 0,
+        };
+        let frame = edit.encode().expect("encode a tile edit");
+        server
+            .on_tile_manipulation(0, &frame[3..])
+            .expect("the kill should be accepted");
+
+        assert!(
+            !server.world.tile(100, 100).is_active(),
+            "the sand above the mined support should have moved"
+        );
+        assert_eq!(
+            server.world.tile(100, 101).block,
+            53,
+            "and landed on the floor directly below"
+        );
+    }
+}
+
+#[cfg(test)]
 mod boulder_mining {
     use super::*;
     use crate::config::Config;
@@ -8333,6 +8384,34 @@ mod boulder_mining {
             Some(item.item.id),
             terrustia_proto::placed_items::placed_item(BOULDER, 0),
             "the item must be the one a boulder of this style is worth"
+        );
+    }
+
+    /// A mined boulder does not just vanish into an item: it becomes the rolling projectile.
+    ///
+    /// `WorldGen.KillTile`'s switch (`WorldGen.cs:50097`, `case 138`) launches
+    /// `ProjectileID.Boulder` at `x * 16 + 15.5`, `y * 16 + 16` from the object's top-left cell,
+    /// at rest, at damage 70. Before this the tile cleared and dropped and the boulder never
+    /// rolled, so a boulder trap could be disarmed by mining it from below.
+    #[test]
+    fn mining_a_boulder_launches_the_rolling_boulder() {
+        let (mut server, _rx, _cells) = server_with_boulder();
+        mine(&mut server, 101, 100); // the bottom-right cell, not the anchor
+        let (_, rolling) = server
+            .projectiles
+            .iter()
+            .find(|(_, p)| p.projectile_type == 99)
+            .expect("a freed boulder must launch the rolling projectile");
+        assert_eq!(rolling.damage, 70, "the launch damage is vanilla's own");
+        assert_eq!(
+            rolling.velocity,
+            (0.0, 0.0),
+            "it starts at rest; the arm is what gives it gravity"
+        );
+        assert_eq!(
+            rolling.center(),
+            (100.0 * 16.0 + 15.5, 99.0 * 16.0 + 16.0),
+            "and from the centre of the 2x2, not from the cell that was hit"
         );
     }
 }
