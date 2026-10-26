@@ -18,15 +18,17 @@ Every `.wld` ends its header with a JSON manifest: all 106 generation passes, **
 order**, each with a `RandNext` — `WorldGen.genRand.Next()` sampled immediately after that pass
 (`WorldGenerator.cs:515`).
 
-Because the generator is **never reseeded** during generation, the value recorded after pass N is
-a fingerprint of every draw made by passes 1 to N. So:
+The game reseeds the generator from the world seed at the **start of every pass**
+(`WorldGenerator.cs:499`), so `RandNext` fingerprints the draws that pass made, not the whole
+prefix before it. A pass that draws nothing records the seed's own first draw; the reference world
+records `143337951` for both "Wavy Caves" and "Mud Caves To Grass", which is the first value for
+seed 12345. So:
 
-> Implement pass N, generate with the same seed, compare. If it matches, the RNG consumption of
-> the whole prefix is exactly right. If it does not, the first pass that disagrees is the one that
-> is wrong.
+> Implement pass N, generate with the same seed, compare. If it matches, that pass's draw count
+> and order are exactly right. If it does not, the pass that disagrees is the one that is wrong.
 
-That turns a 106-link chain — where nothing can be judged until all of it is done — into something
-checkable one pass at a time. Without it the port is unfalsifiable.
+That turns a 106-link sequence — where nothing can be judged until all of it is done — into
+something checkable one pass at a time. Without it the port is unfalsifiable.
 
 ```sh
 cargo run --release -p terrustia --example genparity -- reference.wld
@@ -35,9 +37,9 @@ cargo run --release -p terrustia --example genparity -- reference.wld
 Two further properties worth knowing:
 
 - **Sampling advances the generator.** A port has to take a draw at the same point or it diverges
-  from the very first pass.
+  from that pass's recorded value.
 - **A skipped pass records nothing and consumes zero RNG.** So generating a reference with a pass
-  disabled, and stubbing that pass to draw nothing, matches exactly for every pass after it.
+  disabled, and stubbing that pass to draw nothing, matches exactly for that pass.
   Deferring a pass is therefore *free*, not fatal.
 
 ## What is done
@@ -47,17 +49,25 @@ Two further properties worth knowing:
 - `TranslateSeed`: parse as an integer, else CRC32.
 - The manifest reader, hand-written to avoid a JSON dependency.
 - `genparity`, which reads a reference world's seed and pass record and names the first divergence.
+- `WorldGen.Reset` for an ordinary world: the seed's draws up to the first pass, including the
+  tree, cave and background styles, moon, ore tiers, dungeon side and column, jungle and snow
+  origins, and both beach ends. Every value it produces for the reference world matches that
+  world's own header (tree/cave styles, backgrounds, moon, clouds, wind, world id, ore tiers).
+- `TerrainPass`, the first pass: all five surface shapes, `SurfaceHistory`, the surface and rock
+  layer calculations, `FillColumn`, `RetargetColumn`, `RetargetSurfaceHistory`,
+  `GenerateWorldSurfaceOffset`, and the beach padding (`FlatBeachPadding = 5`).
 
-Against a reference world it currently reports:
+Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-the first to write is "Terrain", whose generator should read 9436581 afterwards.
+all 1 implemented passes match the reference.
+next to write: "Dunes"
 ```
 
 ## What is not
 
-The 106 passes themselves. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 105 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 
@@ -106,6 +116,7 @@ still the terrain spine.
 
 ## What is needed from a human
 
-One or two worlds generated in **Terraria 1.4.5.8** at known numeric seeds, both evils, a small
-and a large. The worlds on disk are 1.4.5.6 (format 319) and older; the target is 326. Work can
-start against the old one — parity just cannot be *certified* with it.
+The Terrain work was checked against a **Terraria 1.4.5.8** world (4200x1200, crimson, seed text
+`12345`), the version and evil this port targets. A second world at another size and the other
+evil would still be valuable: a mistake that happens to agree at 4200/crimson, such as a wrong
+`GetWorldSize()` branch, would otherwise stay invisible.

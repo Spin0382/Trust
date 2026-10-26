@@ -1,12 +1,13 @@
 //! Check a generated world against the one Terraria made from the same seed.
 //!
 //! This is the instrument the whole world-generation port is steered by. A `.wld` records the
-//! state of the world's random generator after every one of its generation passes, and that
-//! generator is never reseeded — so the value after pass N is a fingerprint of every draw made by
-//! passes one to N. Run the port to pass N and compare, and either the whole prefix is exactly
-//! right or the first pass that disagrees is named.
+//! state of the world's random generator after every one of its generation passes. The game
+//! reseeds that generator from the world seed at the start of every pass
+//! (`WorldGenerator.cs:499`), so the value after pass N is a fingerprint of the draws pass N made,
+//! not of the whole chain before it. Run the port's pass N and compare, and either that pass's
+//! draws are exactly right or its first divergence is named.
 //!
-//! Without this the port is unfalsifiable until all hundred and six passes are done. With it,
+//! Without this the port is unfalsifiable until all hundred and six passes are done; with it,
 //! each one is checkable on its own.
 //!
 //! ```sh

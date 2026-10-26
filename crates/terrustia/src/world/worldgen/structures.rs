@@ -452,6 +452,7 @@ pub fn caves(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) {
 /// [`tile_runner`], but it writes `ore` into existing stone instead of carving. The attempt
 /// counts and strength/step ranges come from `OresAndShinies` (`WorldGen.cs:13700`). A point is
 /// only started in stone, the same guard the old pass used, so a vein never hangs in a cave.
+#[allow(clippy::too_many_arguments)]
 fn ore_band(
     world: &mut World,
     rand: &mut UnifiedRandom,

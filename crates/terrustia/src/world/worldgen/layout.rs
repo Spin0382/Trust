@@ -48,6 +48,17 @@ impl Band {
     }
 }
 
+/// One attempt at placing the three free surface bands, and how well it did.
+struct SurfacePlacement {
+    snow: Band,
+    desert: Band,
+    evil: Band,
+    /// Tiles by which any two bands overlap; zero on a world wide enough to fit them all.
+    overlap: i32,
+    /// The widest run of untouched forest between neighbouring bands or an ocean.
+    widest_gap: i32,
+}
+
 /// Everything the passes need to know about where things are.
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -150,6 +161,12 @@ const EVIL_CLEARANCE: i32 = 200;
 /// How far apart two surface biomes must sit.
 const BIOME_GAP: i32 = 40;
 
+/// How many complete surface arrangements to try before keeping the least gappy one.
+///
+/// Each attempt costs a few hundred draws at most, and the terrain pass that follows is measured
+/// in millions, so this is negligible.
+const SURFACE_ATTEMPTS: usize = 64;
+
 impl Layout {
     /// Decide a world's shape.
     ///
@@ -218,36 +235,68 @@ impl Layout {
 
         // The snow, the desert and the evil take what is left, none of them over spawn and none
         // of them on top of each other.
-        let mut taken = vec![jungle];
-        let snow = Self::place(
-            rand,
-            width,
-            ocean_width,
-            (width / 8).clamp(20, 500).min(usable / 3),
-            spawn_x,
-            (width / 20).min(120),
-            &taken,
-        );
-        taken.push(snow);
-        let desert = Self::place(
-            rand,
-            width,
-            ocean_width,
-            (width / 10).clamp(16, 400).min(usable / 3),
-            spawn_x,
-            (width / 20).min(120),
-            &taken,
-        );
-        taken.push(desert);
-        let evil_band = Self::place(
-            rand,
-            width,
-            ocean_width,
-            (width / 9).clamp(18, 450).min(usable / 3),
-            spawn_x,
-            (width / 6).clamp(60, EVIL_CLEARANCE),
-            &taken,
-        );
+        //
+        // Each band used to be placed once, taking the first clear spot. That is uniform over the
+        // whole world, so two bands could land most of a world apart: seed 0 left 849 tiles of
+        // plain forest between the desert and the evil, which is the "large gap between biomes"
+        // a player walks through. Try a handful of complete arrangements and keep the one whose
+        // widest forest gap is smallest. Vanilla's own origins are drawn from wide ranges too
+        // (`WorldGen.cs:11406-11447`, `WorldGen.cs:12552-12564`), so forest between biomes is
+        // expected; this closes the holes, not the forest.
+        let snow_width = (width / 8).clamp(20, 500).min(usable / 3);
+        let desert_width = (width / 10).clamp(16, 400).min(usable / 3);
+        let evil_width = (width / 9).clamp(18, 450).min(usable / 3);
+        let biome_clearance = (width / 20).min(120);
+        let evil_clearance = (width / 6).clamp(60, EVIL_CLEARANCE);
+        let mut best_surface: Option<SurfacePlacement> = None;
+        for _ in 0..SURFACE_ATTEMPTS {
+            let mut taken = vec![jungle];
+            let snow = Self::place(
+                rand,
+                width,
+                ocean_width,
+                snow_width,
+                spawn_x,
+                biome_clearance,
+                &taken,
+            );
+            taken.push(snow);
+            let desert = Self::place(
+                rand,
+                width,
+                ocean_width,
+                desert_width,
+                spawn_x,
+                biome_clearance,
+                &taken,
+            );
+            taken.push(desert);
+            let evil = Self::place(
+                rand,
+                width,
+                ocean_width,
+                evil_width,
+                spawn_x,
+                evil_clearance,
+                &taken,
+            );
+            let (overlap, widest_gap) =
+                Self::surface_gaps(width, ocean_width, &[jungle, snow, desert, evil]);
+            let candidate = SurfacePlacement {
+                snow,
+                desert,
+                evil,
+                overlap,
+                widest_gap,
+            };
+            if best_surface.as_ref().is_none_or(|best| {
+                (candidate.overlap, candidate.widest_gap) < (best.overlap, best.widest_gap)
+            }) {
+                best_surface = Some(candidate);
+            }
+        }
+        let best_surface = best_surface.expect("SURFACE_ATTEMPTS is at least one");
+        let (snow, desert, evil_band) = (best_surface.snow, best_surface.desert, best_surface.evil);
 
         // The temple sits deep under the jungle, above the underworld.
         //
@@ -340,6 +389,36 @@ impl Layout {
             }
         }
         best.expect("the loop runs at least once").1
+    }
+
+    /// The widest untouched run between neighbouring surface bands, and how far any of them
+    /// overlap.
+    ///
+    /// Overlap is returned first, so a world too narrow to fit every band still keeps the
+    /// arrangement that overlaps least rather than one that merely has tidier gaps.
+    fn surface_gaps(width: i32, ocean_width: i32, bands: &[Band]) -> (i32, i32) {
+        let mut ordered = Vec::with_capacity(bands.len() + 2);
+        ordered.push(Band {
+            from: 0,
+            to: ocean_width,
+        });
+        ordered.push(Band {
+            from: width - ocean_width,
+            to: width,
+        });
+        ordered.extend_from_slice(bands);
+        ordered.sort_by_key(|band| band.from);
+        let mut overlap = 0;
+        let mut widest = 0;
+        for pair in ordered.windows(2) {
+            let gap = pair[1].from - pair[0].to;
+            if gap < 0 {
+                overlap += -gap;
+            } else {
+                widest = widest.max(gap);
+            }
+        }
+        (overlap, widest)
     }
 
     /// Which surface biome a column belongs to, if any.
@@ -458,6 +537,50 @@ mod tests {
                     || (l.evil_band.to - l.spawn_x).abs() > 100,
                 "seed {seed} put the evil right beside spawn"
             );
+        }
+    }
+
+    /// No two surface biomes may be separated by a hole of untouched forest.
+    ///
+    /// The bands are placed independently, and a run of random positions can leave two of them
+    /// most of a world apart: seed 0 put 849 tiles of plain forest between the desert and the
+    /// evil, which is the "large gap between biomes" a player walks through. Vanilla's own
+    /// reference world (`.scratch/vanilla.wld`) has its widest surface gap between the desert and
+    /// the snow, about 550 tiles on a 4200-wide world, so a seventh of the width is a generous
+    /// ceiling rather than a target.
+    #[test]
+    fn surface_biomes_leave_no_large_hole_between_them() {
+        for seed in 0..=100 {
+            let l = layout(seed);
+            let mut bands = vec![
+                l.ocean_left,
+                l.ocean_right,
+                l.jungle,
+                l.snow,
+                l.desert,
+                l.evil_band,
+            ];
+            bands.sort_by_key(|band| band.from);
+            for pair in bands.windows(2) {
+                let (left, right) = (pair[0], pair[1]);
+                assert!(
+                    right.from >= left.to,
+                    "seed {seed}: {}..{} overlaps {}..{}",
+                    left.from,
+                    left.to,
+                    right.from,
+                    right.to
+                );
+                let gap = right.from - left.to;
+                assert!(
+                    gap <= l.width / 7,
+                    "seed {seed}: {gap} tiles of forest between {}..{} and {}..{}",
+                    left.from,
+                    left.to,
+                    right.from,
+                    right.to
+                );
+            }
         }
     }
 
