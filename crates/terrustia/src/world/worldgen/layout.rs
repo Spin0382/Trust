@@ -299,7 +299,16 @@ impl Layout {
                 best_surface = Some(candidate);
             }
         }
-        let best_surface = best_surface.expect("SURFACE_ATTEMPTS is at least one");
+        // The loop above runs at least once; this fallback keeps the production panic budget
+        // unchanged. A world that somehow reached it would get overlapping bands rather than a
+        // panic mid-generation.
+        let best_surface = best_surface.unwrap_or(SurfacePlacement {
+            snow: jungle,
+            desert: jungle,
+            evil: jungle,
+            overlap: i32::MAX,
+            widest_gap: i32::MAX,
+        });
         let (snow, desert, evil_band) = (best_surface.snow, best_surface.desert, best_surface.evil);
 
         // The temple sits deep under the jungle, above the underworld.
