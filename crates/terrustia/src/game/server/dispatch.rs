@@ -96,10 +96,13 @@ impl GameServer {
             id <= id::PLAYER_SPAWN || HANDSHAKE_EXTRAS.contains(&id)
         };
         if !allowed {
-            debug!(
+            // Info, not debug: this is what a connection dies of, and the kick text the player
+            // sees names no packet. Without the id here, "sent that too early" is unactionable.
+            info!(
                 slot,
                 id,
                 name = id::name(id),
+                state = ?player.state,
                 "refusing a packet from a connection that has not finished joining"
             );
             self.kick(slot, "Your client sent that too early.");
@@ -575,7 +578,7 @@ impl GameServer {
     fn finish_join_stream(&mut self, slot: u8) {
         if self
             .player(slot)
-            .is_none_or(|p| p.state >= ConnState::TilesSent)
+            .is_none_or(|p| p.join_tail_sent || p.state < ConnState::WorldSent)
         {
             return;
         }
@@ -636,6 +639,7 @@ impl GameServer {
         }
 
         if let Some(player) = self.player_mut(slot) {
+            player.join_tail_sent = true;
             player.advance_to(ConnState::TilesSent);
         }
         match packets::empty(id::INITIAL_SPAWN) {
@@ -811,7 +815,7 @@ impl GameServer {
     fn on_request_section(&mut self, slot: u8, payload: &[u8]) -> terrustia_proto::Result<()> {
         if self
             .player(slot)
-            .is_none_or(|p| p.state < ConnState::TilesSent)
+            .is_none_or(|p| p.state < ConnState::WorldSent)
         {
             return Ok(());
         }
@@ -867,7 +871,13 @@ impl GameServer {
         let was_playing = self.player(slot).is_some_and(Player::is_playing);
 
         if let Some(player) = self.player_mut(slot) {
-            if player.state < ConnState::TilesSent {
+            // Vanilla accepts packet 12 as soon as world data has gone out (`State < 3` is the
+            // only refusal, `MessageBuffer.cs:925`), and advances to the playing state right
+            // there, without waiting for the section stream it started. Waiting for `TilesSent`
+            // here instead meant a client that spawns during loading — the mobile client does —
+            // was silently ignored, and its first controls packet, id 13, then tripped the
+            // handshake guard and earned "Your client sent that too early."
+            if player.state < ConnState::WorldSent {
                 return Ok(()); // spawning before the world arrived is not a valid sequence
             }
             player.team = spawn.team;
@@ -7864,6 +7874,59 @@ mod server_side_effects {
     }
 }
 
+/// A client is allowed to spawn before its section stream has finished, as vanilla allows, and the
+/// join tail still has to follow once the stream drains.
+#[cfg(test)]
+mod early_spawn {
+    use super::*;
+    use crate::config::Config;
+
+    fn spawn_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(0);
+        payload.extend_from_slice(&(-1i16).to_le_bytes());
+        payload.extend_from_slice(&(-1i16).to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&0i16.to_le_bytes());
+        payload.extend_from_slice(&0i16.to_le_bytes());
+        payload.push(0);
+        payload.push(PlayerSpawn::CONTEXT_SPAWNING_INTO_WORLD);
+        payload
+    }
+
+    #[test]
+    fn a_spawn_packet_while_sections_stream_is_accepted() {
+        let mut server = GameServer::new(
+            Config::default(),
+            crate::world::World::empty(200, 150, "early spawn"),
+        );
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().unwrap(), out_tx);
+        player.state = ConnState::WorldSent;
+        player.greeted = true;
+        player.password_ok = true;
+        player.pending_sections.push_back((0, 0));
+        server.players[0] = Some(player);
+
+        server
+            .on_player_spawn(0, &spawn_payload())
+            .expect("a valid spawn");
+
+        assert!(server.player(0).expect("the player").is_playing());
+        assert!(
+            server.handshake_allows(0, id::PLAYER_CONTROLS),
+            "controls must not be refused once the client has spawned"
+        );
+        assert!(
+            !server.player(0).expect("the player").join_tail_sent,
+            "the join tail still has to go out when the stream drains"
+        );
+
+        server.finish_join_stream(0);
+        assert!(server.player(0).expect("the player").join_tail_sent);
+    }
+}
+
 /// Vanilla's join loop sends a `21` and then a `22` for every live item
 /// (`MessageBuffer.cs:843-850`, case 8). This sent only the `21`, so a joining client believed
 /// every item on the ground was free to take: it would walk up to one already reserved for
@@ -8249,7 +8312,7 @@ mod falling_sand_after_edit {
     use crate::config::Config;
 
     #[test]
-    fn mining_the_support_under_sand_drops_it_immediately() {
+    fn mining_the_support_under_sand_drops_it_as_a_falling_projectile() {
         let mut world = crate::world::World::empty(200, 150, "sand trigger probe");
         world.set_tile(100, 100, Tile::block(53));
         world.set_tile(100, 101, Tile::block(1));
@@ -8278,12 +8341,25 @@ mod falling_sand_after_edit {
 
         assert!(
             !server.world.tile(100, 100).is_active(),
-            "the sand above the mined support should have moved"
+            "the sand above the mined support becomes a projectile"
         );
+        assert_eq!(
+            server.projectiles.len(),
+            1,
+            "exactly one block was released"
+        );
+
+        for _ in 0..120 {
+            server.tick_projectiles();
+            if server.projectiles.is_empty() {
+                break;
+            }
+        }
+        assert!(server.projectiles.is_empty(), "and it lands");
         assert_eq!(
             server.world.tile(100, 101).block,
             53,
-            "and landed on the floor directly below"
+            "in the hole the mined block left"
         );
     }
 }

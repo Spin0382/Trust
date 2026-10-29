@@ -580,60 +580,6 @@ pub fn grow_cactus(world: &mut World, x: i32, y: i32) -> Option<(i32, i32)> {
     Some((x, y - 1))
 }
 
-/// Sand, in all four colours, and the muds that fall with it.
-const FALLS: [u16; 6] = [53, 112, 116, 123, 224, 234];
-
-/// Let an unsupported column of sand fall, all the way down.
-///
-/// The game throws a falling-sand projectile and lets it land, so a block that loses its support
-/// arrives at the bottom in one go rather than descending a tile at a time; and because
-/// `SpawnFallingBlockProjectile` runs from `TileFrame` on the tile above as well
-/// (`WorldGen.cs:82665`), the whole stack comes down together. So does this: it finds the landing
-/// row once and moves the contiguous run of falling blocks above `(x, y)` down as a unit.
-///
-/// **This is only half of vanilla's behaviour, and the missing half is the trigger.** Vanilla drops
-/// sand from `TileFrame`, which runs on every tile edit, so a ceiling collapses the instant the
-/// block under it is mined. Here the only trigger is a world-update sample landing on the tile: on
-/// a 4200x1200 world that is 152 overground samples a tick spread over roughly 1.4 million
-/// candidate cells, and 76 underground ones over roughly 3.5 million, so a given tile waits about
-/// two and a half minutes on the surface and about thirteen underground before its collapse even
-/// starts. Falling the whole way once it does start is what can be fixed from inside the world
-/// module; wiring it to the tile-edit path needs the mine and place handlers, which live elsewhere.
-pub fn fall_sand(world: &mut World, x: i32, y: i32, out: &mut Vec<(i32, i32)>) -> bool {
-    if !world.in_bounds(x, y) || !world.in_bounds(x, y + 1) {
-        return false;
-    }
-    if !nactive(world.tile(x, y)) || !FALLS.contains(&world.tile(x, y).block) {
-        return false;
-    }
-    // How far there is to fall: down to the last empty tile in the world below this one.
-    let mut floor = y;
-    while world.in_bounds(x, floor + 1) && !world.tile(x, floor + 1).is_active() {
-        floor += 1;
-    }
-    let drop = floor - y;
-    if drop == 0 {
-        return false;
-    }
-    // The contiguous run of falling blocks resting on this one comes with it.
-    let mut top = y;
-    while world.in_bounds(x, top - 1)
-        && nactive(world.tile(x, top - 1))
-        && FALLS.contains(&world.tile(x, top - 1).block)
-    {
-        top -= 1;
-    }
-    // Bottom upward, so a tile is only ever written after the one it is moving into has been read.
-    for sy in (top..=y).rev() {
-        let block = world.tile(x, sy);
-        world.set_tile(x, sy + drop, block);
-        world.set_tile(x, sy, Tile::AIR);
-        out.push((x, sy));
-        out.push((x, sy + drop));
-    }
-    true
-}
-
 /// Grow whatever will grow on one sampled tile, the way vanilla's `UpdateWorld_OvergroundTile` and
 /// `UpdateWorld_UndergroundTile` do (`WorldGen.cs:72612,73812`). Every tile it changes is pushed
 /// onto `out`, so the caller can reuse one buffer across the whole per-tick sweep and this stays
@@ -748,10 +694,6 @@ pub fn grow_at(
 
     // Grass spreads *from* the sampled tile onto its neighbours; see `spread_grass_from`.
     spread_grass_from(world, x, y, overground, out);
-
-    // Sand is physics rather than growth, so it is tried on every sample. See `fall_sand` for the
-    // trigger this cannot reach from here.
-    fall_sand(world, x, y, out);
 }
 
 #[cfg(test)]
@@ -978,62 +920,6 @@ mod tests {
         world.set_tile(10, 19, Tile::framed(SAPLING, 0, 0));
         let mut rng = SmallRng::seed_from_u64(3);
         assert_eq!(grow_tree(&mut world, 10, 19, &mut rng), None);
-    }
-
-    /// Unsupported sand falls all the way to the floor in one go, and the whole stack above it
-    /// comes down with it.
-    ///
-    /// Fails before the fix: one call moved one tile, so a ten-tile ceiling needed ten separate
-    /// world-update samples to land on it, each a couple of minutes apart on the surface and about
-    /// thirteen underground.
-    #[test]
-    fn sand_falls_until_it_lands() {
-        let mut world = World::empty(40, 40, "sand");
-        world.set_tile(10, 30, Tile::block(1)); // stone floor
-        for y in 18..=20 {
-            world.set_tile(10, y, Tile::block(53)); // a three-tile column in mid-air
-        }
-
-        let mut out = Vec::new();
-        assert!(fall_sand(&mut world, 10, 20, &mut out));
-        for y in 27..=29 {
-            assert_eq!(
-                world.tile(10, y).block,
-                53,
-                "the column should rest at y={y}"
-            );
-        }
-        for y in 18..=20 {
-            assert!(!world.tile(10, y).is_active(), "and nothing left at y={y}");
-        }
-    }
-
-    /// Sand already resting on something stays put.
-    #[test]
-    fn supported_sand_stays() {
-        let mut world = World::empty(40, 40, "sand");
-        world.set_tile(10, 30, Tile::block(1));
-        world.set_tile(10, 29, Tile::block(53));
-        let mut out = Vec::new();
-        assert!(!fall_sand(&mut world, 10, 29, &mut out));
-        assert!(out.is_empty());
-    }
-
-    /// Actuated sand is phased out, and vanilla's world update skips it: `nactive()`, not
-    /// `active()` (`WorldGen.cs:72790`).
-    ///
-    /// Fails before the fix: every gate in this module used bare `active()`, so an actuated block
-    /// a player had phased out to walk through still fell, still grew grass, and still sprouted
-    /// cactus.
-    #[test]
-    fn actuated_sand_does_not_fall() {
-        let mut world = World::empty(40, 40, "sand");
-        world.set_tile(10, 30, Tile::block(1));
-        let mut sand = Tile::block(53);
-        sand.flags.set(TileFlags::ACTUATED, true);
-        world.set_tile(10, 20, sand);
-        let mut out = Vec::new();
-        assert!(!fall_sand(&mut world, 10, 20, &mut out));
     }
 
     /// A vine hangs down from grass, and stops before it reaches the world's floor.
