@@ -111,6 +111,30 @@ impl GameServer {
     }
 
     pub(super) fn handle_packet(&mut self, slot: u8, frame: Frame) {
+        // `MessageBuffer.GetData` returns before its state gate for any id past `MessageID.Count`
+        // (`MessageBuffer.cs:139-142`), which is how a vanilla server ignores a mobile client's
+        // extra messages instead of kicking them. The phone sends id 164 right after its player
+        // info; this server has no arm for it and neither does the PC game, so it is dropped here
+        // and nothing else happens.
+        if frame.id >= id::PC_MESSAGE_COUNT {
+            if self.player(slot).is_some_and(|p| !p.is_playing()) {
+                info!(
+                    slot,
+                    id = frame.id,
+                    len = frame.payload.len(),
+                    head = ?&frame.payload[..frame.payload.len().min(12)],
+                    "ignoring a packet id outside the PC table"
+                );
+            } else {
+                debug!(
+                    slot,
+                    id = frame.id,
+                    len = frame.payload.len(),
+                    "ignoring a packet id outside the PC table"
+                );
+            }
+            return;
+        }
         if !self.handshake_allows(slot, frame.id) {
             return;
         }
@@ -293,7 +317,28 @@ impl GameServer {
                 self.on_town_npc_name_request(slot, &payload)
             }
             other => {
-                debug!(slot, id = other, name = id::name(other), "ignoring packet");
+                // Mobile builds send ids past the PC table; `handshake_allows` lets them through
+                // only so the join can finish, and there is nothing here to run for them. Log
+                // them at info while the connection is still joining, because that is the one
+                // place a person debugging "the phone will not connect" can see what it sent.
+                if self.player(slot).is_some_and(|p| !p.is_playing()) {
+                    info!(
+                        slot,
+                        id = other,
+                        len = payload.len(),
+                        head = ?&payload[..payload.len().min(12)],
+                        "ignoring an unknown packet before the join finished"
+                    );
+                } else {
+                    debug!(
+                        slot,
+                        id = other,
+                        name = id::name(other),
+                        len = payload.len(),
+                        head = ?&payload[..payload.len().min(12)],
+                        "ignoring packet"
+                    );
+                }
                 Ok(())
             }
         };
@@ -7924,6 +7969,43 @@ mod early_spawn {
 
         server.finish_join_stream(0);
         assert!(server.player(0).expect("the player").join_tail_sent);
+    }
+
+    #[test]
+    fn a_mobile_only_packet_is_allowed_and_ignored_before_the_world() {
+        let mut server = GameServer::new(
+            Config::default(),
+            crate::world::World::empty(200, 150, "mobile packet probe"),
+        );
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().unwrap(), out_tx);
+        player.state = ConnState::Identified;
+        player.greeted = true;
+        player.password_ok = true;
+        player.name = "SpinD".to_string();
+        server.players[0] = Some(player);
+
+        server.handle_packet(
+            0,
+            Frame {
+                id: 164,
+                payload: Bytes::from_static(&[1, 2, 3, 4]),
+            },
+        );
+
+        assert!(
+            server.player(0).is_some(),
+            "an unknown mobile extra must not end the connection"
+        );
+        assert_eq!(
+            server.player(0).expect("the player").state,
+            ConnState::Identified,
+            "and it must not advance the handshake by itself"
+        );
+        assert!(
+            !server.handshake_allows(0, id::PLAYER_CONTROLS),
+            "a real PC gameplay packet is still refused before spawn"
+        );
     }
 }
 

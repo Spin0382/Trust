@@ -19,6 +19,12 @@ pub const VERSION_STRING: &str = "Terraria326";
 /// refusing the older one strands anybody who has not updated for no reason at all.
 pub const SUPPORTED_RELEASES: &[u32] = &[325, 326];
 
+/// `MessageID.Count` in 1.4.5.8 (`MessageID.cs:340`): PC message ids are `0..=162`.
+///
+/// Mobile builds number their own client messages past this point, so an id at or above it
+/// cannot be a PC message at all.
+pub const PC_MESSAGE_COUNT: u8 = 163;
+
 pub const HELLO: u8 = 1;
 pub const KICK: u8 = 2;
 pub const PLAYER_INFO: u8 = 3;
