@@ -81,13 +81,13 @@ Against the reference world (4200x1200, crimson, seed text `12345`) it now repor
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-15/106 recorded passes are implemented, and 15 of those match the reference's draw stream.
+16/106 recorded passes are implemented, and 16 of those match the reference's draw stream.
 every implemented pass matches.
-next to write: "Generate Ice Biome"
+next to write: "Grass"
 ```
 
-and the tile check below says our world is **identical to vanilla's after each of passes 1 to 6**,
-tile for tile, walls and liquids included.
+and the tile check below says our world is **identical to vanilla's after each of passes 1 to 8**,
+in every field a `.wld` can carry.
 
 ### Two oracles, because one is not enough
 
@@ -147,13 +147,15 @@ runs 756 times and a truncating cast runs 755. The missing band-1 runner was the
 and it is why the loop in that pass keeps its bound as an `f64`.
 
 With those three fixed, every registered pass matches the reference draw stream, and the tile check
-is clean through pass 6: the world after `Terrain`, `Dunes`, `Ocean Sand`, `Sand Patches`,
-`Tunnels` and `Mount Caves` is the one Terraria made from the same seed, to the tile. Pass 7 onward
-is matched on draws and awaits its own step files, which take about a minute each to make.
+is clean through pass 8. One caveat belongs with it: the comparison covers only what the file format
+can express. A `TileRunner` with `addTile` false writes its type onto inactive tiles too and the game
+keeps that in memory, but a `.wld` has no room for a block under an inactive tile, so a loaded
+reference reads 0 there and the test ignores that half rather than failing on a difference the
+shipped server could not send either.
 
 ## What is not
 
-The other 91 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 90 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

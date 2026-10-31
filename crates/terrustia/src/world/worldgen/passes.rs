@@ -119,10 +119,19 @@ pub struct GenVars {
     pub mount_cave_x: Vec<i32>,
     pub mount_cave_y: Vec<i32>,
     pub num_mount_caves: usize,
+    /// `GenVars.snowMinX`/`snowMaxX`: the ice biome's edge column at each row, written by
+    /// `Generate Ice Biome` and read back by everything later that calls the snow a place.
+    pub snow_min_x: Vec<i32>,
+    pub snow_max_x: Vec<i32>,
+    /// `GenVars.snowTop` and `GenVars.snowBottom`: the first and last rows the ice biome reached.
+    pub snow_top: i32,
+    pub snow_bottom: i32,
 }
 
 impl GenVars {
     pub fn new(seed: i32, world: World) -> Self {
+        // Read before `world` moves into the struct below.
+        let height = world.height();
         Self {
             rand: UnifiedRandom::new(seed),
             seed,
@@ -181,6 +190,10 @@ impl GenVars {
             mount_cave_x: vec![0; 30],
             mount_cave_y: vec![0; 30],
             num_mount_caves: 0,
+            snow_min_x: vec![0; height as usize],
+            snow_max_x: vec![0; height as usize],
+            snow_top: 0,
+            snow_bottom: 0,
         }
     }
 }
@@ -257,6 +270,10 @@ pub const PASSES: &[Pass] = &[
     Pass {
         name: "Wavy Caves",
         run: super::wavy_caves::run,
+    },
+    Pass {
+        name: "Generate Ice Biome",
+        run: super::ice_biome::run,
     },
 ];
 
@@ -682,24 +699,24 @@ mod tests {
                 for row in 0..reference.height() {
                     let a = vars.world.tile(column, row);
                     let b = reference.tile(column, row);
-                    if (a.is_active() != b.is_active()
-                        || a.block != b.block
-                        || a.wall != b.wall
-                        || a.liquid != b.liquid
-                        || a.liquid_kind != b.liquid_kind)
-                        && differences.len() < 8
-                    {
+                    // Only what a `.wld` can carry. A `TileRunner` with `addTile` false writes its
+                    // type onto inactive tiles as well, and the game keeps that in memory, but the
+                    // file has no room for a block under an inactive tile - a loaded reference reads
+                    // 0 there, and liquid is the same case. Comparing the invisible half would fail
+                    // on a difference the shipped server cannot even send to a client.
+                    let visible = |tile: terrustia_proto::Tile| {
+                        (
+                            tile.is_active(),
+                            if tile.is_active() { tile.block } else { 0 },
+                            tile.wall,
+                            if tile.is_active() { tile.liquid } else { 0 },
+                        )
+                    };
+                    if visible(a) != visible(b) && differences.len() < 8 {
                         differences.push(format!(
-                            "({column},{row}) ours active={} block={} wall={} liquid={} | \
-                                 theirs active={} block={} wall={} liquid={}",
-                            a.is_active(),
-                            a.block,
-                            a.wall,
-                            a.liquid,
-                            b.is_active(),
-                            b.block,
-                            b.wall,
-                            b.liquid,
+                            "({column},{row}) ours {:#?} | theirs {:#?}",
+                            visible(a),
+                            visible(b),
                         ));
                     }
                 }
