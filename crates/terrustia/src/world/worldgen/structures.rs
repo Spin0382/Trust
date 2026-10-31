@@ -355,29 +355,35 @@ fn caverer(world: &mut World, x: i32, y: i32, rand: &mut UnifiedRandom) {
 /// `layout.underworld` stands in for `maxTilesY` in the seed ranges for that reason.
 ///
 /// **`GenVars`' layer pairs collapse.** Vanilla tracks `worldSurfaceLow`/`worldSurfaceHigh` and
-/// `rockLayerLow`/`rockLayerHigh` (`TerrainPass.cs:230-236`) because its layer boundaries follow
-/// the terrain; this project's `Layout` has one flat line for each. `layout.rock` stands in for
-/// `rockLayerHigh`, and `layout.surface - 25` for `worldSurfaceLow`/`worldSurfaceHigh` - the 25 is
-/// vanilla's own offset between them (`Main.worldSurface = worldSurfaceHigh + 25`,
-/// `TerrainPass.cs:206`), kept because the mid-world reroll below is a no-op if the two are equal.
-pub fn caves(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) {
+/// `rockLayerLow`/`rockLayerHigh` (`TerrainPass.cs:235-237`) because its layer boundaries follow
+/// the terrain; this project's `Layout` has one flat line for each. The actual `heights` array is
+/// passed in so the surface pair can still be the real highest and lowest points of the line it
+/// drew, and only the rock pair collapses to `layout.rock`.
+pub fn caves(world: &mut World, layout: &Layout, heights: &[i32], rand: &mut UnifiedRandom) {
     let area = i64::from(layout.width) * i64::from(layout.height);
-    let surface_high = layout.surface - 25;
+    // `GenVars.worldSurfaceHigh` (`TerrainPass.cs:236`) is the deepest point of the actual surface
+    // line, not one flat value. This used to pass `layout.surface - 25` for it, which is above the
+    // ground almost everywhere: the small holes seeded from there started in the sky, broke
+    // through the surface in thousands of places, and left the dirt walls of the old ground
+    // hanging in the open.
+    let world_surface_high = heights.iter().copied().max().unwrap_or(layout.surface);
+    // `Main.worldSurface = worldSurfaceHigh + 25` (`TerrainPass.cs:206`).
+    let main_world_surface = world_surface_high + 25;
     // `GenVars.smallHolesBeachAvoidance = beachSandRandomCenter + 20` (`WorldGen.cs:11231`).
     let beach_avoid = layout.ocean_left.to + 20;
     // Every seed range below is `Next(a, b)` with `a < b`; a world too small for that is not one
     // this generator carves at all.
-    if layout.rock >= layout.underworld || surface_high >= layout.underworld {
+    if layout.rock >= layout.underworld || world_surface_high >= layout.underworld {
         return;
     }
 
     // A seed the spawn area and the beaches must not get: vanilla rerolls until the point is
     // outside them (`WorldGen.cs:12074-12078`).
     let reroll = |x: i32, y: i32| {
-        ((x < beach_avoid || x > layout.width - beach_avoid) && y < surface_high)
+        ((x < beach_avoid || x > layout.width - beach_avoid) && y < world_surface_high)
             || (f64::from(x) > f64::from(layout.width) * 0.45
                 && f64::from(x) < f64::from(layout.width) * 0.55
-                && y < layout.surface)
+                && y < main_world_surface)
     };
 
     // `SmallHoles`: two runners per iteration, a tiny one and a fat short one. This is the pass
@@ -389,10 +395,12 @@ pub fn caves(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) {
         let _wet = rand.next_max(5) == 0;
         for (min_strength, max_strength, min_steps, max_steps) in [(2, 5, 2, 20), (8, 15, 7, 30)] {
             let mut x = rand.next_range(0, layout.width);
-            let mut y = rand.next_range(surface_high, layout.underworld);
+            // `WorldGen.cs:12063`: `Next(worldSurfaceHigh, maxTilesY)`. Starting at the deepest
+            // point of the surface is what keeps these holes underground.
+            let mut y = rand.next_range(world_surface_high, layout.underworld);
             while reroll(x, y) {
                 x = rand.next_range(0, layout.width);
-                y = rand.next_range(surface_high, layout.underworld);
+                y = rand.next_range(world_surface_high, layout.underworld);
             }
             let mut strength = f64::from(rand.next_range(min_strength, max_strength));
             let mut steps = rand.next_range(min_steps, max_steps);
@@ -412,10 +420,18 @@ pub fn caves(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) {
     for _ in 0..dirt_layer {
         let _wet = rand.next_max(6) == 0;
         let mut x = rand.next_range(0, layout.width);
-        let mut y = rand.next_range(surface_high, layout.rock + 1);
+        // `WorldGen.cs:12129` starts these at worldSurfaceLow, the highest point of a surface
+        // line that varies by hundreds of tiles. Its runners are therefore well inside the ground
+        // by the time they reach the local surface. This heightmap varies by only ~45 tiles, so
+        // the same global start would begin at or above the ground in most columns and open cave
+        // mouths all over the surface. Starting at the local surface plus a runner's own reach
+        // gives the same property: the bore begins inside the dirt, never in the air above it.
+        let start = (heights[x as usize] + 8).min(layout.rock);
+        let mut y = rand.next_range(start, layout.rock + 1);
         while reroll(x, y) {
             x = rand.next_range(0, layout.width);
-            y = rand.next_range(surface_high, layout.rock + 1);
+            let start = (heights[x as usize] + 8).min(layout.rock);
+            y = rand.next_range(start, layout.rock + 1);
         }
         let strength = f64::from(rand.next_range(5, 15));
         let steps = rand.next_range(30, 200);
@@ -1853,7 +1869,7 @@ mod cave_wall_tests {
         world.crimson = plan.evil == crate::world::worldgen::layout::Evil::Crimson;
         let heights = crate::world::worldgen::terrain::heightmap(&plan, &mut rand);
         crate::world::worldgen::terrain::fill(&mut world, &plan, &heights, &mut rand);
-        caves(&mut world, &plan, &mut rand);
+        caves(&mut world, &plan, &heights, &mut rand);
 
         let (from, to) = (plan.rock + 30, world.height() - 200);
         let mut rng = 12345u64;
@@ -2073,7 +2089,7 @@ mod cave_topology_measurement {
             // building. The carve is single-threaded, so thread CPU time is its real cost.
             let started = crate::game::clock::Cpu::now();
             crate::world::worldgen::terrain::fill(&mut world, &plan, &heights, &mut rand);
-            caves(&mut world, &plan, &mut rand);
+            caves(&mut world, &plan, &heights, &mut rand);
             let carved = crate::game::clock::Cpu::now().since(started);
             report(
                 &format!("seed {seed} (fill+caves, {carved:?})"),

@@ -473,7 +473,7 @@ pub fn build_with_secret_seed(
     let heights = terrain::heightmap(&plan, &mut rand);
     terrain::fill(&mut world, &plan, &heights, &mut rand);
 
-    structures::caves(&mut world, &plan, &mut rand);
+    structures::caves(&mut world, &plan, &heights, &mut rand);
     structures::ores(&mut world, &plan, &mut rand);
 
     // `GravitatingSandCleanup` (pass 36) then `DirtWallCleanup` (39) — both run here in vanilla's
@@ -739,8 +739,8 @@ pub fn build_with_secret_seed(
     // difference either way — this project already discloses seeds not being map-identical to real
     // Terraria), at the cost of invalidating this row's own already-measured, already-published
     // counts for no behavioural gain.
-    let cave_wall_variety = wall_variety::variety(&mut world, &plan, &mut rand);
-    let cave_walls_enclosed = wall_variety::enclosed_spaces(&mut world, &plan, &mut rand);
+    let cave_wall_variety = wall_variety::variety(&mut world, &plan, &heights, &mut rand);
+    let cave_walls_enclosed = wall_variety::enclosed_spaces(&mut world, &plan, &heights, &mut rand);
     let moss_changed = moss::scatter(&mut world, &plan, &mut rand);
     let long_moss = moss::hang_long_moss(&mut world);
     // `QuickCleanup` (70), then `SurfaceOreAndStone` (74), then `SurfaceDirtWallsToGrassWalls`

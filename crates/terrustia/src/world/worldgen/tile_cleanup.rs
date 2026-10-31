@@ -981,7 +981,7 @@ mod tests {
             let heights = super::super::terrain::heightmap(&plan, &mut rand);
             let mut world = World::empty(width, height, "gravitating-sand-parity");
             super::super::terrain::fill(&mut world, &plan, &heights, &mut rand);
-            super::super::structures::caves(&mut world, &plan, &mut rand);
+            super::super::structures::caves(&mut world, &plan, &heights, &mut rand);
             super::super::structures::ores(&mut world, &plan, &mut rand);
 
             let mut reference = world.clone();
