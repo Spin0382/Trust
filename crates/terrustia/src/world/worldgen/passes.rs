@@ -21,6 +21,7 @@
 
 use super::manifest::Manifest;
 use super::rand::UnifiedRandom;
+use super::structure_map::StructureMap;
 use crate::world::World;
 
 /// Which side the dungeon was placed on (`WorldGen.cs:11402-11405`).
@@ -105,6 +106,12 @@ pub struct GenVars {
     pub remix_mushroom_layer_high: i32,
     pub remix_surface_layer_low: i32,
     pub remix_surface_layer_high: i32,
+    /// `GenVars.structures`: the shared structure map every biome adds to and checks against.
+    pub structures: StructureMap,
+    /// `GenVars.PyrX`/`PyrY`/`numPyr`: the pyramid sites the Dunes pass records.
+    pub pyr_x: Vec<i32>,
+    pub pyr_y: Vec<i32>,
+    pub num_pyr: usize,
 }
 
 impl GenVars {
@@ -158,6 +165,10 @@ impl GenVars {
             remix_mushroom_layer_high: 0,
             remix_surface_layer_low: 0,
             remix_surface_layer_high: 0,
+            structures: StructureMap::new(),
+            pyr_x: Vec::new(),
+            pyr_y: Vec::new(),
+            num_pyr: 0,
         }
     }
 }
@@ -174,10 +185,16 @@ pub struct Pass {
 ///
 /// The order is taken from the manifest of a real world rather than from the order the game
 /// registers them in, because the two disagree in places and the manifest is what actually ran.
-pub const PASSES: &[Pass] = &[Pass {
-    name: "Terrain",
-    run: super::terrain_pass::run,
-}];
+pub const PASSES: &[Pass] = &[
+    Pass {
+        name: "Terrain",
+        run: super::terrain_pass::run,
+    },
+    Pass {
+        name: "Dunes",
+        run: super::dunes::run,
+    },
+];
 
 /// Where a port stopped agreeing with a reference world.
 #[derive(Debug, Clone, PartialEq, Eq)]
