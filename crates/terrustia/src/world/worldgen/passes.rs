@@ -230,6 +230,14 @@ pub const PASSES: &[Pass] = &[
         name: "Rocks In Dirt",
         run: super::rocks_in_dirt::run,
     },
+    Pass {
+        name: "Dirt In Rocks",
+        run: super::dirt_in_rocks::run,
+    },
+    Pass {
+        name: "Clay",
+        run: super::clay::run,
+    },
 ];
 
 /// Where a port stopped agreeing with a reference world.

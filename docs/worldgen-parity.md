@@ -69,13 +69,13 @@ Two further properties worth knowing:
 - `Dunes`, which is `DunesBiome.Place`: the sand hills, the pyramid sites, and the 112 draws that
   make the reference world's dunes tile-for-tile.
 - `Ocean Sand`, `Sand Patches` and `Tunnels`, on the shared `WorldGen.TileRunner` port.
-- `Mount Caves`, `Dirt Wall Backgrounds` and `Rocks In Dirt`.
+- `Mount Caves`, `Dirt Wall Backgrounds`, `Rocks In Dirt`, `Dirt In Rocks` and `Clay`.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-8/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
+10/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
 ```
 
 ### What the oracle cannot see, and what that costs
@@ -107,14 +107,22 @@ property, but the shipped `Terraria.Testing/QuickLoad.cs` does: a JSON config fi
 path can be reached without the client UI - which is the open question, since the class also calls
 `MessageBox.Show` and reads `IWindowService`.
 
-Until that exists, a pass that reads tiles can be built and even run, but not proved.
-Rocks In Dirt is the clearest measurement of what the gap costs: it draws 3,448,247 times in the
-reference and 3,441,096 times in ours, so 0.2% of a pass that is almost entirely `TileRunner`. The
-shared runner is right; the 7,151 draws that differ are the terrain talking.
+Until that exists, a pass that reads tiles can be built and even run, but not proved. The three
+layer passes that have been ported do at least bound the size of the remaining terrain error,
+because each is nearly all `TileRunner` and each draws millions of times:
+
+| pass | reference draws | ours | gap |
+| --- | --- | --- | --- |
+| Rocks In Dirt | 3,448,247 | 3,441,096 | -0.21% |
+| Dirt In Rocks | 3,732,828 | 3,663,323 | -1.86% |
+| Clay | 525,114 | 547,032 | +4.17% |
+
+The shared runner is therefore right: a wrong taper would show as a large, one-sided gap, not
+fractions of a percent that go both ways. What is left is the ground it runs through.
 
 ## What is not
 
-The other 98 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 96 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

@@ -33,8 +33,10 @@
 
 pub mod cave_flood;
 pub mod celebration;
+pub mod clay;
 pub mod dead_mans_chest;
 pub mod desert;
+pub mod dirt_in_rocks;
 pub mod dirt_wall_backgrounds;
 pub mod dirt_wall_cleanup;
 pub mod dont_starve;
