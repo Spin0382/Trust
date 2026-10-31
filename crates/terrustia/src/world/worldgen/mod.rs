@@ -67,6 +67,7 @@ pub mod pots;
 pub mod pyramids;
 pub mod rand;
 pub mod reset;
+pub mod rocks_in_dirt;
 pub mod sand_patches;
 pub mod scenery;
 pub mod secret_seed;

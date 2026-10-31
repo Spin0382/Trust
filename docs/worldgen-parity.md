@@ -32,7 +32,16 @@ something checkable one pass at a time. Without it the port is unfalsifiable.
 
 ```sh
 cargo run --release -p terrustia --example genparity -- reference.wld
+cargo run --release -p terrustia --example genparity -- reference.wld --counts
 ```
+
+`--counts` decodes every recorded pass back into the number of draws that pass took, which turns
+the reference world into a per-pass budget. For seed 12345 on a 4200x1200 world the range is wide
+and not obvious from the code: **twelve passes draw nothing at all**, `Lakes` draws 453, `Mount
+Caves` 780, `Clay` half a million, `Rock Layer Caves` 6.8 million, and `Jungle` more than the 40
+million the scan reaches. The 105 passes it can decode come to 76.2 million draws, so Jungle alone
+is at least a third of the whole generation and twelve passes are free. "Port the next pass" means
+very different amounts of work depending on which one it is.
 
 Two further properties worth knowing:
 
@@ -60,13 +69,13 @@ Two further properties worth knowing:
 - `Dunes`, which is `DunesBiome.Place`: the sand hills, the pyramid sites, and the 112 draws that
   make the reference world's dunes tile-for-tile.
 - `Ocean Sand`, `Sand Patches` and `Tunnels`, on the shared `WorldGen.TileRunner` port.
-- `Mount Caves` and `Dirt Wall Backgrounds`.
+- `Mount Caves`, `Dirt Wall Backgrounds` and `Rocks In Dirt`.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-7/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
+8/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
 ```
 
 ### What the oracle cannot see, and what that costs
@@ -83,14 +92,29 @@ two we lost were rejected by sand sitting where vanilla's own surface was a few 
 is a terrain difference reporting itself as an RNG difference.
 
 The reference world cannot settle it, because by then it has had all 106 passes applied to it: the
-same column shows later Crimstone and caves where pass 6 saw untouched ground. So the next piece of
-tooling is vanilla's tile state *entering* pass N, which is finding 1 below: the shipped worldgen
-debugger already hashes the world after every pass, and a stopped-after-N pass loop writes the
-intermediate world directly.
+same column shows later Crimstone and caves where pass 6 saw untouched ground. So the missing tool
+is vanilla's tile state *entering* pass N.
+
+`genparity --save` and `--diff` are the two halves we control: they write the world our passes
+built and compare its surface line and tile mix against any other `.wld`. What is still needed is
+the other side of that comparison, and the game appears to already have it. A
+`WorldGenerator.Controller` has a `SnapshotFrequency` which, on `Always`, makes it call
+`WorldGenSnapshot.Create()` after every pass, writing tiles and `GenVars` to disk per pass
+(`WorldGenerator.cs:141-160`, `WorldGenSnapshot.cs:196`). Nothing on a dedicated server sets that
+property, but the shipped `Terraria.Testing/QuickLoad.cs` does: a JSON config file selects a
+`RegenTargetPassName`, sets `SnapshotFrequency`, and pauses after that one pass
+(`QuickLoad.cs:199-203`). That is a tile oracle with no IL patching at all, as long as the config
+path can be reached without the client UI - which is the open question, since the class also calls
+`MessageBox.Show` and reads `IWindowService`.
+
+Until that exists, a pass that reads tiles can be built and even run, but not proved.
+Rocks In Dirt is the clearest measurement of what the gap costs: it draws 3,448,247 times in the
+reference and 3,441,096 times in ours, so 0.2% of a pass that is almost entirely `TileRunner`. The
+shared runner is right; the 7,151 draws that differ are the terrain talking.
 
 ## What is not
 
-The other 99 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 98 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

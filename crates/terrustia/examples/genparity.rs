@@ -43,6 +43,48 @@ fn draw_count(seed: i32, value: i64, limit: usize) -> Option<usize> {
     None
 }
 
+/// Print every recorded pass's draw count.
+///
+/// The manifest stores one number per pass, and that number is a position in the reseeded stream,
+/// so it decodes back into how many numbers the pass consumed. The whole table turns the
+/// reference world into a per-pass budget: which passes are trivial, which draw hundreds of
+/// thousands of times, and - once a pass is ported - the exact target its draw count has to hit.
+fn print_counts(manifest: &Manifest, seed: i32) {
+    // One walk of the stream answers all hundred and six lookups at once. Scanning per pass would
+    // be O(passes x draws) and the heavy passes draw tens of millions of times.
+    let mut wanted: std::collections::HashMap<i64, usize> = manifest
+        .ran()
+        .map(|entry| (entry.rand_next, usize::MAX))
+        .collect();
+    let limit = 40_000_000;
+    let mut rand = UnifiedRandom::new(seed);
+    for index in 0..=limit {
+        let value = i64::from(rand.next());
+        if let Some(slot) = wanted.get_mut(&value)
+            && *slot == usize::MAX
+        {
+            *slot = index;
+        }
+        if wanted.values().all(|found| *found != usize::MAX) {
+            break;
+        }
+    }
+    println!("draw counts, decoded from the reference manifest for seed {seed}:");
+    let mut heavy = 0;
+    for (index, entry) in manifest.ran().enumerate() {
+        let found = wanted.get(&entry.rand_next).copied().unwrap_or(usize::MAX);
+        if found == usize::MAX {
+            heavy += 1;
+            println!("{:>4}  {:>8}  {}", index + 1, ">40M", entry.name);
+        } else {
+            println!("{:>4}  {:>8}  {}", index + 1, found, entry.name);
+        }
+    }
+    if heavy > 0 {
+        println!("({heavy} passes draw more than the scan budget)");
+    }
+}
+
 /// The value following a flag in the command line.
 fn arg_after(flag: &str) -> Option<String> {
     env::args()
@@ -217,6 +259,11 @@ fn main() -> ExitCode {
     }
     println!();
 
+    if env::args().any(|a| a == "--counts") {
+        print_counts(&manifest, seed);
+        return ExitCode::SUCCESS;
+    }
+
     // Run the port as far as it goes, and compare pass by pass.
     let outcome = terrustia::world::worldgen::compare_against(&manifest, seed, &world);
     let diff_at = arg_after("--diff");
@@ -273,7 +320,9 @@ fn main() -> ExitCode {
         "{}/{} recorded passes are implemented, and {} of those match the reference's draw stream.",
         outcome.checked, total, outcome.matches
     );
-    let limit = 400_000;
+    // Large enough for the heaviest passes: `Rock Layer Caves` draws nearly seven million times,
+    // and the draw-count decode has to reach past it to be a target for every pass.
+    let limit = 45_000_000;
     for diverged in &outcome.divergences {
         println!();
         println!("pass {}: {:?}", diverged.index + 1, diverged.name);

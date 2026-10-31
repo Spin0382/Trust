@@ -226,6 +226,10 @@ pub const PASSES: &[Pass] = &[
         name: "Dirt Wall Backgrounds",
         run: super::dirt_wall_backgrounds::run,
     },
+    Pass {
+        name: "Rocks In Dirt",
+        run: super::rocks_in_dirt::run,
+    },
 ];
 
 /// Where a port stopped agreeing with a reference world.
