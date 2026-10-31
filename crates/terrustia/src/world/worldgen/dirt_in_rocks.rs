@@ -40,10 +40,7 @@ impl<'a> Draws<'a> {
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
     let height = vars.world.height();
-    let ctx = RunnerContext {
-        world_surface: vars.world_surface,
-        water_line: vars.water_line,
-    };
+    let ctx = RunnerContext::ordinary(vars);
     // Truncations match vanilla's `(int)` cast on the layer double.
     let rock_low = vars.rock_layer_low as i32;
 
@@ -57,9 +54,10 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
         let y = rng.next_range(rock_low, height);
         let strength = f64::from(rng.next_range(2, 6));
         let steps = rng.next_range(2, 40);
-        // `TileRunner(x, y, strength, steps, 0)`, the rest at the game's own defaults.
+        // `TileRunner(x, y, strength, steps, 0)`, the rest at the game's own defaults, which are
+        // `addTile: false` and both speeds 0.
         draws += tile_runner(
-            world, rng.rand, ctx, x, y, strength, steps, DIRT, false, 2.0, 2.0, false, true, -1,
+            world, rng.rand, ctx, x, y, strength, steps, DIRT, false, 0.0, 0.0, false, true, -1,
         );
     }
 

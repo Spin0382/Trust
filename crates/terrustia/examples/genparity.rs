@@ -133,6 +133,26 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
     };
     let counts_ours = histogram(ours);
     let counts_theirs = histogram(theirs);
+    // Where dirt turns to stone, column by column. `TerrainPass.FillColumn` is driven by a
+    // per-column rock layer, so a depth error there moves a boundary rather than the surface, and
+    // it reads as "more stone, less dirt" in the tile mix long before it looks like a bad surface.
+    let stone_line = |world: &terrustia::world::World, column: i32| -> i32 {
+        for row in 0..height {
+            if world.tile(column, row).block == 1
+                && (0..3).all(|d| world.tile(column, row + d).block == 1)
+            {
+                return row;
+            }
+        }
+        height
+    };
+    let stone_deltas: Vec<i32> = (0..width)
+        .map(|column| stone_line(ours, column) - stone_line(theirs, column))
+        .collect();
+    let stone_equal = stone_deltas.iter().filter(|d| **d == 0).count();
+    let stone_abs: Vec<i64> = stone_deltas.iter().map(|d| i64::from(*d).abs()).collect();
+    let mut stone_sorted = stone_abs.clone();
+    stone_sorted.sort_unstable();
     let equal = deltas.iter().filter(|d| **d == 0).count();
     let abs: Vec<i64> = deltas.iter().map(|d| i64::from(*d).abs()).collect();
     let columns = abs.len().max(1);
@@ -165,6 +185,15 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
         .map(|(d, column)| format!("col {column} {d:+}"))
         .collect();
     println!("  furthest columns: {}", top.join(", "));
+    println!(
+        "  dirt->stone line within 0 rows: {}/{} columns ({:.1}%), mean {:.1}, p90 {}, worst {}",
+        stone_equal,
+        columns,
+        100.0 * stone_equal as f64 / columns as f64,
+        stone_abs.iter().sum::<i64>() as f64 / columns as f64,
+        stone_sorted[columns * 9 / 10],
+        stone_sorted[columns - 1]
+    );
     // The tile mix, so a pass that writes the wrong block is obvious even when the surface agrees.
     let mut types: Vec<u16> = counts_ours
         .keys()
@@ -173,12 +202,20 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
         .collect();
     types.sort_unstable();
     types.dedup();
+    // Tile counts fit well inside an i64, and the subtraction has to be signed: `saturating_sub`
+    // on u64 renders "we have 10,552 fewer sand tiles" as a flat 0, which is exactly the direction
+    // worth seeing.
     let mut rows: Vec<(i64, u16, u64, u64)> = types
         .iter()
         .map(|t| {
             let a = counts_ours.get(t).copied().unwrap_or(0);
             let b = counts_theirs.get(t).copied().unwrap_or(0);
-            (i64::try_from(a.saturating_sub(b)).unwrap_or(0), *t, a, b)
+            (
+                i64::try_from(a).unwrap_or(0) - i64::try_from(b).unwrap_or(0),
+                *t,
+                a,
+                b,
+            )
         })
         .collect();
     rows.sort_by(|a, b| b.0.abs().cmp(&a.0.abs()));
@@ -268,20 +305,26 @@ fn main() -> ExitCode {
     let outcome = terrustia::world::worldgen::compare_against(&manifest, seed, &world);
     let diff_at = arg_after("--diff");
     if save_at.is_some() || diff_at.is_some() {
-        let passes = terrustia::world::worldgen::passes::PASSES;
+        let all = terrustia::world::worldgen::passes::PASSES;
+        // `--passes N` limits the build to the first N registered passes, which is what makes the
+        // comparison against a world stopped after pass N meaningful.
+        let count = arg_after("--passes")
+            .and_then(|text| text.parse::<usize>().ok())
+            .unwrap_or(all.len())
+            .min(all.len());
         let built = terrustia::world::worldgen::passes::run_passes(
             seed,
             world.width(),
             world.height(),
             &world.name,
             world.crimson,
-            passes.len(),
+            count,
         );
         if let Some(out) = save_at {
             match terrustia::world::wld_save::serialize(&built) {
                 Ok(bytes) => match std::fs::write(&out, &bytes) {
                     Ok(()) => {
-                        eprintln!("saved the world our {} passes built to {out}", passes.len());
+                        eprintln!("saved the world our {count} passes built to {out}");
                     }
                     Err(e) => eprintln!("could not write {out}: {e}"),
                 },

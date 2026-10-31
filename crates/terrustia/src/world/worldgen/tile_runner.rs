@@ -100,30 +100,58 @@ fn save_slope(block: u16) -> bool {
 
 /// Whether a runner may replace this tile.
 ///
-/// `TileRunner`'s `flag4` switch (`WorldGen.cs:77845-77880`). The branches that draw are kept;
-/// they only run for a runner of type 59 (mud), which is why a sand patch consumes none of them.
-fn over_ride_skips(
+/// `TileRunner`'s `flag4` block (`WorldGen.cs:77833-77886`). Two things about its shape matter:
+///
+/// - The stone rule is the **initial value**, not an extra test: `flag4 = Main.tileStone[type] &&
+///   tile.type != 1`, and the switch that follows can set `flag4` either way. Testing the arms
+///   first and only ever escalating to "skip" loses the arms that clear it.
+/// - The sand arm is what protects a beach. A runner over an existing sand tile does not paint
+///   above `Main.worldSurface` unless it is carrying mud (59), and never paints clay (40) over
+///   sand at all.
+fn override_skip(
     tile: &terrustia_proto::Tile,
     runner_type: u16,
+    column: i32,
+    row: i32,
+    ctx: RunnerContext,
     rand: &mut UnifiedRandom,
 ) -> bool {
+    let mut skip = tile_stone(runner_type) && tile.block != 1;
     if !can_be_cleared(tile.block) {
-        return true;
+        skip = true;
     }
     match tile.block {
-        45 | 147 | 189 | 190 | 196 | 460 | 717 | 718 | 719 => true,
-        396 | 397 => true,
-        1 => {
-            if runner_type == 59 {
-                let _ = rand.next_range(-50, 50);
-                true
-            } else {
-                false
+        53 => {
+            if runner_type == 59 && ctx.underground_desert.contains(column, row) {
+                skip = true;
+            }
+            if runner_type == 40 {
+                skip = true;
+            }
+            if (row as f64) < ctx.world_surface && runner_type != 59 {
+                skip = true;
             }
         }
-        367 | 368 => runner_type == 59,
-        _ => false,
+        45 | 147 | 189 | 190 | 196 | 460 | 717 | 718 | 719 => skip = true,
+        // `flag4 = !TileID.Sets.Ore[type]`. Sandstone and hardened sand do not exist until the
+        // Desert and Oasis passes, and no runner ported so far carries an ore type, so this is
+        // indistinguishable from `true` for every pass that reaches it today. Re-read the set
+        // before the first ore-carrying runner is registered.
+        396 | 397 => skip = true,
+        1 => {
+            // The draw is inside the test in vanilla too, and `&&` short-circuits it the same way,
+            // so a runner that is not mud consumes nothing here.
+            if runner_type == 59
+                && (row as f64) < ctx.world_surface + f64::from(rand.next_range(-50, 50))
+            {
+                skip = true;
+            }
+        }
+        // Vanilla's `case 367 / case 368` only ever sets the flag, so the type test is an arm guard.
+        367 | 368 if runner_type == 59 => skip = true,
+        _ => {}
     }
+    skip
 }
 
 /// `Main.tileStone`: the gem and a few stone-like tiles whose replacement follows the stone rule.
@@ -131,11 +159,51 @@ fn tile_stone(block: u16) -> bool {
     matches!(block, 63 | 64 | 65 | 66 | 67 | 68 | 130 | 131 | 566)
 }
 
+/// `System.Drawing.Rectangle` as the generation code uses it: an origin and a size, exclusive on
+/// the far edge.
+#[derive(Clone, Copy, Default)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl Rect {
+    fn contains(&self, column: i32, row: i32) -> bool {
+        column >= self.x
+            && column < self.x + self.width
+            && row >= self.y
+            && row < self.y + self.height
+    }
+}
+
 /// What a [`TileRunner`] call needs from `GenVars` beyond the world and RNG.
 #[derive(Clone, Copy)]
 pub struct RunnerContext {
+    /// `Main.worldSurface`, the highest surface row plus 25 - **not** `GenVars.worldSurface`,
+    /// which is the surface of the last column Terrain painted. The two differ by roughly 64 rows
+    /// on a small world, and `TileRunner` reads the `Main.` one in its sand and wall branches.
     pub world_surface: f64,
     pub water_line: i32,
+    /// `GenVars.UndergroundDesertLocation`, empty until the Desert biome pass fills it in. Only
+    /// the mud (59) runner branch reads it, so every pass ported so far sees it empty and the same
+    /// either way.
+    pub underground_desert: Rect,
+}
+
+impl RunnerContext {
+    /// The context an ordinary-world pass sees: `Main.worldSurface`, the real water line, and no
+    /// underground desert yet. Prefer this over building the struct by hand; picking
+    /// `GenVars.worldSurface` here silently relocates every runner in the pass, and the draw count
+    /// does not change, so the RNG oracle will not catch it.
+    pub fn ordinary(vars: &super::passes::GenVars) -> Self {
+        Self {
+            world_surface: f64::from(vars.world.surface),
+            water_line: vars.water_line,
+            underground_desert: Rect::default(),
+        }
+    }
 }
 
 /// `WorldGen.TileRunner` for the ordinary-world path, type >= 0 only.
@@ -221,10 +289,7 @@ pub fn tile_runner(
                 let mut tile = world.tile(k, l);
                 let mut skip = false;
                 if over_ride && tile.is_active() {
-                    skip = over_ride_skips(&tile, tile_type, rand);
-                    if !skip && tile_stone(tile_type) && tile.block != 1 {
-                        skip = true;
-                    }
+                    skip = override_skip(&tile, tile_type, k, l, ctx, rand);
                 }
                 if !skip {
                     tile.block = tile_type;

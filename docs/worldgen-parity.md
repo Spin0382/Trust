@@ -75,7 +75,7 @@ Against the reference world (4200x1200, crimson, seed text `12345`) it now repor
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-10/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
+10/106 recorded passes are implemented, and 9 of those match the reference's draw stream.
 ```
 
 ### What the oracle cannot see, and what that costs
@@ -86,39 +86,53 @@ each pass is reseeded and its `RandNext` is therefore its own proof. That matter
 
 `RandNext` says nothing about tiles, and from pass 6 onward several passes branch on them. Mount
 Caves screens a 100 by 50 box around the first solid tile in its column and refuses to dig if it
-finds sand, so its draw count is a function of the terrain. The reference drew 780 numbers there
-and we drew 384, which decodes cleanly: vanilla dug in all four attempts and we dug in two, and the
-two we lost were rejected by sand sitting where vanilla's own surface was a few rows higher. That
-is a terrain difference reporting itself as an RNG difference.
+finds sand, so its draw count is a function of the terrain. The reference drew 780 numbers there and
+we drew 384, which decodes cleanly: vanilla dug in all four attempts and we dug in two. That is a
+tile difference reporting itself as an RNG difference, and the rest of this section is about how it
+got found - the diagnosis first written here ("our surface sits lower than vanilla's") was wrong,
+which is exactly why the tool below was worth building.
 
 The reference world cannot settle it, because by then it has had all 106 passes applied to it: the
-same column shows later Crimstone and caves where pass 6 saw untouched ground. So the missing tool
-is vanilla's tile state *entering* pass N.
+same column shows later Crimstone and caves where pass 6 saw untouched ground. So the tool that was
+missing was vanilla's tile state *entering* pass N.
 
-`genparity --save` and `--diff` are the two halves we control: they write the world our passes
-built and compare its surface line and tile mix against any other `.wld`. What is still needed is
-the other side of that comparison, and the game appears to already have it. A
-`WorldGenerator.Controller` has a `SnapshotFrequency` which, on `Always`, makes it call
-`WorldGenSnapshot.Create()` after every pass, writing tiles and `GenVars` to disk per pass
-(`WorldGenerator.cs:141-160`, `WorldGenSnapshot.cs:196`). Nothing on a dedicated server sets that
-property, but the shipped `Terraria.Testing/QuickLoad.cs` does: a JSON config file selects a
-`RegenTargetPassName`, sets `SnapshotFrequency`, and pauses after that one pass
-(`QuickLoad.cs:199-203`). That is a tile oracle with no IL patching at all, as long as the config
-path can be reached without the client UI - which is the open question, since the class also calls
-`MessageBox.Show` and reads `IWindowService`.
+That tool now exists, and it is a two-line idea: truncate the pass list and let the game save. A
+Mono.Cecil patch on `WorldGenerator/Controller::get_Passes` - the property the generation loop
+reads through (`foreach (GenPass item in Passes.Skip(num))`, `WorldGenerator.cs:133`) - calls
+`RemoveRange(stop, Count - stop)` on the list before returning it. The patched server then generates
+a world that genuinely stopped after pass N and writes it through the normal save path. The recipe,
+including the `-autocreate 1` / nonexistent `-world` invocation that the server actually needs, is
+in `.scratch/oracle/README.md`; the tooling lives there too, because it requires a local Terraria
+install and can no more be committed than the decompiled tree that `just regen` reads.
 
-Until that exists, a pass that reads tiles can be built and even run, but not proved. The three
-layer passes that have been ported do at least bound the size of the remaining terrain error,
-because each is nearly all `TileRunner` and each draws millions of times:
+(The shipped `Terraria.Testing/QuickLoad.cs` looks like a patch-free route to the same thing: it
+sets `SnapshotFrequency` and `PauseAfterPass` from a JSON file. It is not reachable headless - its
+load path runs from the client's splash screen and calls `MessageBox.Show` - and
+`DebugOverrides`, the other candidate, is `[Conditional("DEBUG")]` and so absent from the shipped
+assembly.)
 
-| pass | reference draws | ours | gap |
-| --- | --- | --- | --- |
-| Rocks In Dirt | 3,448,247 | 3,441,096 | -0.21% |
-| Dirt In Rocks | 3,732,828 | 3,663,323 | -1.86% |
-| Clay | 525,114 | 547,032 | +4.17% |
+`genparity --passes N --diff <stopped world>` compares what our passes built against what vanilla's
+did, on the surface row, the dirt-to-stone row and the active-tile count per type. First run, and
+what it found:
 
-The shared runner is therefore right: a wrong taper would show as a large, one-sided gap, not
-fractions of a percent that go both ways. What is left is the ground it runs through.
+| step | result |
+| --- | --- |
+| after pass 1 | every column matches: 4200 surfaces, 4200 dirt-to-stone lines, dirt 558,248 and stone 3,448,135 on both sides |
+| after pass 3 | identical except 23 sand tiles that Dunes placed at columns 2968-2976 |
+| after pass 4 | dirt and stone exact, sand +23 - the same 23, nothing new |
+
+So `Terrain` is exact, and the pass-6 Mount Caves failure was not terrain height after all. It was
+a name: `Main.worldSurface` and `GenVars.worldSurface` are different numbers on the same world -
+331 and 267 - and the port had been feeding the `GenVars.` one to passes whose vanilla source reads
+the `Main.` one. Sand Patches picks its depth band from `Main.worldSurface` and `Main.rockLayer`, so
+every patch sat about 64 rows too shallow; Mount Caves walks columns to `Main.worldSurface`; Dirt
+Wall Backgrounds paints to `Main.worldSurface + 10`. None of those mistakes change a draw count, so
+the RNG oracle passed all three while the tiles were wrong.
+
+`RunnerContext::ordinary` now builds that context in one place, and the passes that read the line
+directly say which of the two they mean. Nine of the ten registered passes match the reference draw
+stream; Rocks In Dirt is 4,125 draws high on 3,448,247, consistent with the 23-tile Dunes
+difference still upstream of it.
 
 ## What is not
 

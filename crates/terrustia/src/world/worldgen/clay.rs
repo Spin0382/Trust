@@ -44,15 +44,12 @@ impl<'a> Draws<'a> {
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
     let height = vars.world.height();
-    let ctx = RunnerContext {
-        world_surface: vars.world_surface,
-        water_line: vars.water_line,
-    };
+    let ctx = RunnerContext::ordinary(vars);
     let surface_low = vars.world_surface_low as i32;
     let surface_high = vars.world_surface_high as i32;
     let rock_high = vars.rock_layer_high as i32;
-    // The crust walk stops one row above the surface line, as the original's loop bound says.
-    let crust_limit = vars.world_surface - 1.0;
+    // The crust walk stops one row above `Main.worldSurface - 1.0`, the `Main.` line again.
+    let crust_limit = f64::from(vars.world.surface) - 1.0;
     let area = f64::from(width) * f64::from(height);
 
     let GenVars { rand, world, .. } = vars;
@@ -125,7 +122,7 @@ fn runner(
     steps: i32,
 ) -> usize {
     tile_runner(
-        world, rand, ctx, x, y, strength, steps, CLAY, false, 2.0, 2.0, false, true, -1,
+        world, rand, ctx, x, y, strength, steps, CLAY, false, 0.0, 0.0, false, true, -1,
     )
 }
 

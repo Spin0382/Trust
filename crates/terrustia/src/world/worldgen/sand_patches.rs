@@ -31,12 +31,14 @@ impl<'a> Draws<'a> {
 /// Run the pass, returning how many draws it took.
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
-    let world_surface = vars.world_surface;
-    let rock_layer = vars.rock_layer;
-    let ctx = RunnerContext {
-        world_surface,
-        water_line: vars.water_line,
-    };
+    // `Main.worldSurface` and `Main.rockLayer`, not `GenVars.worldSurface` and `GenVars.rockLayer`.
+    // The two pairs differ by roughly 64 and 30 rows on the reference world (`Main.worldSurface` is
+    // `worldSurfaceHigh + 25`), and this pass picks its depth from the `Main.` pair, so taking the
+    // other one buries every patch in the dirt band instead of reaching the stone. The draw count
+    // is unaffected, which is why the RNG oracle passed while the tiles did not.
+    let main_world_surface = f64::from(vars.world.surface);
+    let main_rock_layer = f64::from(vars.world.rock_layer);
+    let ctx = RunnerContext::ordinary(vars);
     let GenVars { rand, world, .. } = vars;
     let mut rng = Draws::new(rand);
     let mut draws = 0usize;
@@ -44,13 +46,13 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
     let attempts = (f64::from(width) * 0.013) as i32;
     for _ in 0..attempts {
         let mut x = rng.next_range(0, width);
-        let mut y = rng.next_range(world_surface as i32, rock_layer as i32);
+        let mut y = rng.next_range(main_world_surface as i32, main_rock_layer as i32);
         while f64::from(x) > f64::from(width) * 0.46
             && f64::from(x) < f64::from(width) * 0.54
-            && f64::from(y) < world_surface + 150.0
+            && f64::from(y) < main_world_surface + 150.0
         {
             x = rng.next_range(0, width);
-            y = rng.next_range(world_surface as i32, rock_layer as i32);
+            y = rng.next_range(main_world_surface as i32, main_rock_layer as i32);
         }
         let strength = f64::from(rng.next_range(15, 70));
         let steps = rng.next_range(20, 130);

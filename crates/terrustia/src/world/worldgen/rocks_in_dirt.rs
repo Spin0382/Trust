@@ -49,10 +49,7 @@ impl<'a> Draws<'a> {
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
     let height = vars.world.height();
-    let ctx = RunnerContext {
-        world_surface: vars.world_surface,
-        water_line: vars.water_line,
-    };
+    let ctx = RunnerContext::ordinary(vars);
     // Truncations match vanilla's `(int)` casts on the layer doubles.
     let surface_low = vars.world_surface_low as i32;
     let surface_high = vars.world_surface_high as i32;
@@ -100,8 +97,10 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
 }
 
 /// One runner: `TileRunner(x, y, strength, steps, 1)`, all the other arguments left at the
-/// defaults the game declares (`addTile: false`, `speedX`/`speedY` 2, `noYChange: false`,
-/// `overRide: true`, `ignoreTileType: -1`).
+/// defaults the game declares (`addTile: false`, `speedX`/`speedY` 0, `noYChange: false`,
+/// `overRide: true`, `ignoreTileType: -1`). Passing a non-zero speed is not a no-op: the game
+/// still draws for the random drift and then throws both values away, so the wrong speed keeps the
+/// draw count identical while sending the runner somewhere else.
 fn stone_runner(
     world: &mut crate::world::World,
     rand: &mut UnifiedRandom,
@@ -112,7 +111,7 @@ fn stone_runner(
     steps: i32,
 ) -> usize {
     tile_runner(
-        world, rand, ctx, x, y, strength, steps, STONE, false, 2.0, 2.0, false, true, -1,
+        world, rand, ctx, x, y, strength, steps, STONE, false, 0.0, 0.0, false, true, -1,
     )
 }
 

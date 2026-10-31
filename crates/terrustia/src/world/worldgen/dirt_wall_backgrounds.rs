@@ -30,7 +30,9 @@ const SNOW_BLOCK: u16 = 147;
 /// Run the pass, returning how many draws it took.
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
-    let surface = vars.world_surface;
+    // `Main.worldSurface`, which is the highest surface row plus 25 - the pass paints down to
+    // `worldSurface + 10`, so using `GenVars.worldSurface` here stops the walls ~64 rows early.
+    let surface = f64::from(vars.world.surface);
     let rand = &mut vars.rand;
     let world = &mut vars.world;
 

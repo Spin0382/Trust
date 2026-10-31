@@ -38,10 +38,7 @@ impl<'a> Draws<'a> {
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
     let height = vars.world.height();
-    let ctx = RunnerContext {
-        world_surface: vars.world_surface,
-        water_line: vars.water_line,
-    };
+    let ctx = RunnerContext::ordinary(vars);
     let GenVars {
         rand,
         world,

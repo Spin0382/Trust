@@ -115,7 +115,9 @@ fn mountinater(
 pub fn run_counted(vars: &mut GenVars) -> usize {
     let width = vars.world.width();
     let height = vars.world.height();
-    let surface = vars.world_surface;
+    // `Main.worldSurface`, not `GenVars.worldSurface`: the walk runs to the highest surface row
+    // plus 25, so a column whose ground sits below the last-painted line is still searched.
+    let surface = f64::from(vars.world.surface);
     let GenVars {
         rand,
         world,
