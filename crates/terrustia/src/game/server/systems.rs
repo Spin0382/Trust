@@ -3394,12 +3394,29 @@ impl GameServer {
         self.tick_tablet_shards();
         let mut spent = Vec::new();
         let mut emitted = Vec::new();
-        {
-            let tiles = WorldTiles(&self.world);
-            for (index, projectile) in self.projectiles.iter_mut() {
-                if crate::game::projectile::step(projectile, &tiles, &mut emitted)
-                    == crate::game::projectile::Outcome::Spent
-                {
+        let indices: Vec<u16> = self.projectiles.iter().map(|(index, _)| index).collect();
+        for index in indices {
+            let outcome = {
+                let tiles = WorldTiles(&self.world);
+                match self.projectiles.get_mut(index) {
+                    Some(projectile) => {
+                        crate::game::projectile::step(projectile, &tiles, &mut emitted)
+                    }
+                    None => continue,
+                }
+            };
+            if outcome == crate::game::projectile::Outcome::Spent {
+                // Vanilla runs `Kill` inside the projectile's own update, so a falling block
+                // places its tile before the block above it is stepped. Deferring every kill to
+                // the end of the sweep let the upper block sink into the cell the lower one was
+                // about to fill, find it taken, and turn into a dropped item instead of stacking.
+                let falling = self
+                    .projectiles
+                    .get(index)
+                    .is_some_and(|p| fallen_tile(p.projectile_type).is_some());
+                if falling {
+                    self.kill_projectile(index);
+                } else {
                     spent.push(index);
                 }
             }
@@ -3960,6 +3977,9 @@ impl GameServer {
         let Some(projectile) = self.projectiles.remove(index) else {
             return;
         };
+        // A falling block puts itself back before its death is announced: vanilla's `Kill` places
+        // the tile, and only then does the network layer send the kill.
+        self.land_falling_block(&projectile);
         if let Ok(frame) = (terrustia_proto::projectile::KillProjectile {
             key: projectile.key,
             position: projectile.position,
@@ -6186,8 +6206,6 @@ impl GameServer {
     /// anchor, then a still boulder (projectile 99, 70 damage, 10 knockback) dropped from the middle
     /// of its base, twenty-eight pixels down.
     fn fire_boulder_statue(&mut self, x: i32, y: i32) {
-        /// `ProjectileID.Boulder`.
-        const BOULDER: u16 = 99;
         /// `CheckMech(num90, num91, 900)` - fifteen seconds between boulders.
         const BOULDER_COOLDOWN: i32 = 900;
 
@@ -6198,9 +6216,9 @@ impl GameServer {
         // same reason: the statue has gone off, and should not retry every tick.
         self.mech_cooldown.insert((x, y), BOULDER_COOLDOWN);
         let position = ((x + 1) as f32 * 16.0, y as f32 * 16.0 + 28.0);
-        if let Some(index) = self
-            .projectiles
-            .launch(BOULDER, position, (0.0, 0.0), 70, 0)
+        if let Some(index) =
+            self.projectiles
+                .launch(Self::BOULDER_PROJECTILE, position, (0.0, 0.0), 70, 0)
         {
             self.broadcast_projectile(index);
         }
@@ -9191,6 +9209,113 @@ impl GameServer {
             || self.npcs.iter().any(|(_, n)| n.stats.boss && n.is_alive())
     }
 
+    /// Drop unsupported falling tiles after an edit, the way `TileFrame` does
+    /// (`WorldGen.cs:82665`). The world-update sample alone can leave a mined sand ceiling
+    /// floating for minutes; an edit is the moment vanilla actually runs the check.
+    ///
+    /// Each block becomes a falling-block projectile, exactly as
+    /// `WorldGen.SpawnFallingBlockProjectile` does (`WorldGen.cs:87330-87384`): the tile is cleared,
+    /// a projectile appears at its centre already moving half a pixel a tick, and gravity takes
+    /// over. Moving the tiles directly, which this used to do, was instantaneous and invisible:
+    /// vanilla's visible fall, its dust, and its landing puff are all properties of that projectile
+    /// and of the client's own `AI_010` (`Projectile.cs:58815-59090`), not of the tile edit.
+    pub(super) fn settle_falling_sand_after_edit(&mut self, x: i32, y: i32) {
+        let mut falling = Vec::new();
+        let x0 = (x - 1).max(1);
+        let x1 = (x + 1).min(self.world.width() - 2);
+        let y1 = y.min(self.world.height() - 2);
+        for cx in x0..=x1 {
+            // Bottom-up: clearing one tile leaves the one above unsupported in this same pass,
+            // which is how vanilla's `SquareTileFrame` cascades a whole stack into projectiles.
+            for cy in (1..=y1).rev() {
+                let tile = self.world.tile(cx, cy);
+                if !sandfall_active(tile) {
+                    continue;
+                }
+                let Some(projectile_type) = sandfall_projectile(tile.block) else {
+                    continue;
+                };
+                if !allows_sandfall(self.world.tile(cx, cy - 1)) {
+                    continue;
+                }
+                if !block_below_makes_sand_fall(&self.world, cx, cy) {
+                    continue;
+                }
+
+                self.world.set_tile(cx, cy, Tile::AIR);
+                falling.push((cx, cy, projectile_type));
+            }
+        }
+        // The clears go out before the projectiles, the order vanilla's own server produces: the
+        // tile square is sent inline from `SpawnFallingBlockProjectile` and the projectile's sync
+        // is flushed at the end of the tick.
+        for &(cx, cy, _) in &falling {
+            self.broadcast_tile(cx, cy);
+        }
+        for (cx, cy, projectile_type) in falling {
+            // The centre is two pixels below the tile's own, and the first velocity is the half
+            // pixel the game gives a freshly spawned block.
+            if let Some(index) = self.projectiles.launch(
+                projectile_type,
+                (cx as f32 * 16.0 + 8.0, cy as f32 * 16.0 + 10.0),
+                (0.0, 0.5),
+                10,
+                0,
+            ) {
+                // `ai[0] = 1` is what makes `AI_010` apply gravity (`Projectile.cs:58995-59010`).
+                // The server reaches that latch on its first update in vanilla and syncs it; a
+                // client that received zero would draw the block hovering between syncs.
+                if let Some(projectile) = self.projectiles.get_mut(index) {
+                    projectile.ai[0] = 1.0;
+                }
+                self.broadcast_projectile(index);
+            }
+        }
+    }
+
+    /// Put a landed falling block back into the world.
+    ///
+    /// `Projectile.Kill`'s `aiStyle == 10` arm (`Projectile.cs:79124-79308`): the projectile's
+    /// centre names the tile it lands in, a half brick is stood on rather than entered
+    /// (`:79249`), and a spot with no room drops the block as an item instead (`:79301`). It runs
+    /// here rather than in `projectile::step` because placing a tile needs the world, which the
+    /// stepper deliberately cannot see.
+    fn land_falling_block(&mut self, projectile: &crate::game::projectile::Projectile) {
+        let Some(tile_type) = fallen_tile(projectile.projectile_type) else {
+            return;
+        };
+        let (centre_x, centre_y) = projectile.center();
+        let tx = (centre_x / 16.0).floor() as i32;
+        let mut ty = (centre_y / 16.0).floor() as i32;
+        if !self.world.in_bounds(tx, ty) {
+            return;
+        }
+        let here = self.world.tile(tx, ty);
+        if here.is_active()
+            && here.flags.has(TileFlags::HALF_BRICK)
+            && projectile.velocity.1 > 0.0
+            && projectile.velocity.1.abs() > projectile.velocity.0.abs()
+        {
+            ty -= 1;
+        }
+        if !self.world.in_bounds(tx, ty) {
+            return;
+        }
+        if self.world.tile(tx, ty).is_active() {
+            self.spawn_tile_drop(tile_type, -1, -1, tx, ty);
+            return;
+        }
+        // `flag2`: some floors refuse the block (`Projectile.cs:79252-79282`), and neither placing
+        // nor dropping happens there.
+        let below = self.world.tile(tx, ty + 1);
+        let refuses = below.is_active() && matches!(below.block, 314 | 421 | 422);
+        if refuses || block_below_makes_sand_fall(&self.world, tx, ty) {
+            return;
+        }
+        self.world.set_tile(tx, ty, Tile::block(tile_type));
+        self.broadcast_tile(tx, ty);
+    }
+
     /// Try to spawn new NPCs around the players.
     pub(super) fn tick_spawning(&mut self) {
         if self.ticks.is_multiple_of(300) {
@@ -9462,6 +9587,9 @@ impl GameServer {
     /// `TileID.Sets.Boulders`: every member is one framed 2x2 `TileObjectData` object.
     const BOULDERS: [u16; 10] = [138, 484, 664, 665, 711, 712, 713, 714, 715, 716];
 
+    /// `ProjectileID.Boulder`, what a freed boulder tile becomes.
+    const BOULDER_PROJECTILE: u16 = 99;
+
     /// The four cells of one complete framed boulder, top-left first, or `None` when `(x, y)` is
     /// not part of one.
     ///
@@ -9551,6 +9679,21 @@ impl GameServer {
         }
         if drops_item {
             self.spawn_tile_drop(tile.block, tile.frame_x, tile.frame_y, x, y);
+        }
+        // A freed boulder is not only an item. `WorldGen.KillTile`'s own switch
+        // (`WorldGen.cs:50097`, `case 138`) launches `ProjectileID.Boulder` from the middle of the
+        // object at rest, and the projectile's own arm gives it its gravity; without this a mined
+        // boulder broke and dropped instead of rolling. The position is vanilla's arithmetic on
+        // the object's top-left cell, `x * 16 + 15.5` and `y * 16 + 16`, which is the centre of
+        // the 2x2. It fires even when the tile drops nothing, because vanilla's switch sits after
+        // the item block and is not gated on it.
+        let (ox, oy) = (cells[0].0, cells[0].1);
+        let position = (ox as f32 * 16.0 + 15.5, oy as f32 * 16.0 + 16.0);
+        if let Some(index) =
+            self.projectiles
+                .launch(Self::BOULDER_PROJECTILE, position, (0.0, 0.0), 70, 0)
+        {
+            self.broadcast_projectile(index);
         }
         true
     }
@@ -10024,6 +10167,172 @@ impl GameServer {
         let index = self.take_item_slot(item, position)?;
         self.broadcast_item(index);
         Some(index)
+    }
+}
+
+/// `TileID.Sets.Falling` (`TileID.cs:395`) with the projectile each tile becomes
+/// (`WorldGen.GetSandfallProjData`, `WorldGen.cs:87807-87852`).
+fn sandfall_projectile(tile: u16) -> Option<u16> {
+    Some(match tile {
+        53 => 31,   // Sand -> SandBallFalling
+        112 => 56,  // Ebonsand
+        116 => 67,  // Pearlsand
+        123 => 71,  // Silt
+        224 => 179, // Slush
+        234 => 241, // Crimsand
+        330 => 411, // Copper coin pile
+        331 => 412, // Silver coin pile
+        332 => 413, // Gold coin pile
+        333 => 414, // Platinum coin pile
+        495 => 812, // Shell pile
+        _ => return None,
+    })
+}
+
+/// The tile a landed falling block turns back into (`Projectile.cs:79124-79308`).
+fn fallen_tile(projectile: u16) -> Option<u16> {
+    Some(match projectile {
+        31 => 53,
+        56 => 112,
+        67 => 116,
+        71 => 123,
+        179 => 224,
+        241 => 234,
+        411 => 330,
+        412 => 331,
+        413 => 332,
+        414 => 333,
+        812 => 495,
+        _ => return None,
+    })
+}
+
+/// Vanilla's `nactive()`: an active tile that is not phased out by an actuator. The growth pass
+/// already reads the same flag this way.
+fn sandfall_active(tile: Tile) -> bool {
+    tile.is_active() && !tile.flags.has(TileFlags::ACTUATED)
+}
+
+/// `WorldGen.BlockBelowMakesSandFall` (`WorldGen.cs:87878-87903`): air, a non-solid support, or a
+/// stalactite all let the block above go.
+fn block_below_makes_sand_fall(world: &crate::world::World, x: i32, y: i32) -> bool {
+    if y >= world.height() - 1 {
+        return false;
+    }
+    let below = world.tile(x, y + 1);
+    if !sandfall_active(below) {
+        return true;
+    }
+    let below_two = world.tile(x, y + 2);
+    if !sandfall_active(below_two)
+        && (!below.is_active() || !terrustia_proto::tile_solid::solid(below.block))
+    {
+        return true;
+    }
+    below.is_active() && below.block == 165
+}
+
+/// `WorldGen.AllowsSandfall` (`WorldGen.cs:87905-87917`): a block under furniture that floats
+/// stays put, so the furniture does not come down with it.
+fn allows_sandfall(tile: Tile) -> bool {
+    const FLOATING_OBJECTS: [u16; 12] = [21, 26, 77, 80, 88, 323, 441, 467, 468, 470, 475, 597];
+    !(tile.is_active() && FLOATING_OBJECTS.contains(&tile.block))
+}
+
+/// Sand falls as a projectile rather than a tile teleport, so it takes ticks to arrive and the
+/// client has something to draw dust around.
+#[cfg(test)]
+mod falling_sand {
+    use super::*;
+    use crate::config::Config;
+
+    fn sand_world(column: std::ops::RangeInclusive<i32>) -> crate::world::World {
+        let mut world = crate::world::World::empty(60, 60, "sand probe");
+        for x in 0..60 {
+            for y in 40..=45 {
+                world.set_tile(x, y, Tile::block(1)); // dirt to land on
+            }
+        }
+        for y in column {
+            world.set_tile(20, y, Tile::block(53)); // sand
+        }
+        world
+    }
+
+    #[test]
+    fn a_mined_support_turns_the_sand_above_into_a_slow_projectile() {
+        let mut server = GameServer::new(Config::default(), sand_world(39..=39));
+        server.world.set_tile(20, 40, Tile::AIR);
+
+        server.settle_falling_sand_after_edit(20, 40);
+
+        assert!(
+            !server.world.tile(20, 39).is_active(),
+            "the block leaves the tile grid"
+        );
+        assert_eq!(server.projectiles.len(), 1, "and becomes one projectile");
+        let projectile = server.projectiles.iter().next().expect("the sand").1;
+        assert_eq!(projectile.projectile_type, 31);
+        assert_eq!(projectile.velocity, (0.0, 0.5), "vanilla's first speed");
+
+        // One tick in, the block has barely moved: this is the visible delay vanilla has.
+        server.tick_projectiles();
+        assert_eq!(server.projectiles.len(), 1, "it must not land instantly");
+        assert!(
+            !server.world.tile(20, 40).is_active(),
+            "the hole is still a hole on the first tick"
+        );
+
+        for _ in 0..120 {
+            server.tick_projectiles();
+            if server.projectiles.is_empty() {
+                break;
+            }
+        }
+        assert!(server.projectiles.is_empty(), "it eventually lands");
+        assert_eq!(
+            server.world.tile(20, 40).block,
+            53,
+            "and refills the hole it fell into"
+        );
+    }
+
+    #[test]
+    fn supported_sand_never_becomes_a_projectile() {
+        let mut server = GameServer::new(Config::default(), sand_world(39..=39));
+
+        server.settle_falling_sand_after_edit(20, 40);
+
+        assert!(server.projectiles.is_empty());
+        assert_eq!(server.world.tile(20, 39).block, 53);
+    }
+
+    #[test]
+    fn a_whole_column_falls_one_block_at_a_time() {
+        let mut server = GameServer::new(Config::default(), sand_world(37..=39));
+        server.world.set_tile(20, 40, Tile::AIR);
+
+        server.settle_falling_sand_after_edit(20, 40);
+        assert_eq!(
+            server.projectiles.len(),
+            3,
+            "every tile of the stack lets go"
+        );
+
+        for _ in 0..200 {
+            server.tick_projectiles();
+            if server.projectiles.is_empty() {
+                break;
+            }
+        }
+        assert!(server.projectiles.is_empty(), "the stack all lands");
+        for y in 38..=40 {
+            assert_eq!(
+                server.world.tile(20, y).block,
+                53,
+                "the column settles one tile lower at y={y}"
+            );
+        }
     }
 }
 

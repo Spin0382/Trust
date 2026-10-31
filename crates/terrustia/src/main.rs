@@ -127,6 +127,7 @@ async fn run(palette: Palette) -> Result<Stopped, Box<dyn std::error::Error>> {
         // rather than reading it back from here — see that function's own doc comment for why a
         // typed seed is not pre-split into "the number" and "the text" before reaching it.
         config.seed = worldgen::secret_seed::numeric_seed(seed);
+        config.seed_was_set = true;
     }
     if let Some(world_file) = args.world {
         config.world_file = Some(world_file);
@@ -235,12 +236,25 @@ async fn run(palette: Palette) -> Result<Stopped, Box<dyn std::error::Error>> {
                     config.world_name.clone(),
                     seed_text,
                 ),
-                None => worldgen::build(
-                    config.world_width,
-                    config.world_height,
-                    config.world_name.clone(),
-                    config.seed,
-                ),
+                None => {
+                    // No seed from any layer means a fresh world, so draw one. Keeping the default
+                    // zero here made every `--new` without `--seed` the exact same map, which is
+                    // the opposite of what the help text and vanilla's empty seed field promise.
+                    let seed = if config.seed_was_set {
+                        config.seed
+                    } else {
+                        let seed = rand::random::<u64>();
+                        config.seed = seed;
+                        info!(seed, "no seed was given; generating with a random one");
+                        seed
+                    };
+                    worldgen::build(
+                        config.world_width,
+                        config.world_height,
+                        config.world_name.clone(),
+                        seed,
+                    )
+                }
             };
             world
         }

@@ -4,12 +4,14 @@
 //! passes, in the order they ran, and the state of the world's random generator immediately
 //! afterwards. The game writes it as a diagnostic. For a port it is something better — an oracle.
 //!
-//! Because the generator is never reseeded during generation, the value recorded after pass N is
-//! a fingerprint of every draw made by passes one to N. Implement pass N, generate with the same
-//! seed, and compare: if it matches, the RNG consumption of the whole prefix is exactly right,
-//! and if it does not, the first pass that disagrees is the one that is wrong. That turns a
-//! hundred-and-six-link chain, where nothing can be judged until all of it is done, into
-//! something that can be checked one pass at a time.
+//! The game reseeds the generator from the world seed at the start of every pass
+//! (`WorldGenerator.cs:499`) and samples it after the pass (`WorldGenerator.cs:515`), so the value
+//! recorded after pass N fingerprints the draws of pass N itself. Implement pass N, generate from
+//! the same seed, and compare: if it matches, that pass's draw count and order are exactly right,
+//! and if it does not, the value names how far off it is. The first value of a pass that draws
+//! nothing is the seed's own first draw, which is how a reseeded pass is recognisable in a
+//! manifest (the reference world's "Wavy Caves" and "Mud Caves To Grass" both record
+//! `143337951`, the first draw for seed 12345).
 //!
 //! A pass the game was told to skip records no state at all, which is what makes deferring one
 //! free rather than fatal: a stub that draws nothing matches a reference generated with that pass

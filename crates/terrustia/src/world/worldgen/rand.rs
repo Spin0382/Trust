@@ -1,9 +1,11 @@
 //! Terraria's own random number generator.
 //!
-//! World generation is a chain: every pass draws from one generator that is never reseeded, so
-//! the world a seed produces depends on the exact *number* of draws every earlier pass made, not
-//! only on what they did with them. Reproducing a world therefore starts here — an approximation
-//! of the generator is no use at all, and neither is a different one seeded the same way.
+//! World generation depends on this generator being exact because every pass draws a fixed
+//! sequence from a generator the game reseeds from the world seed at the start of that pass
+//! (`WorldGenerator.cs:499`). Within a pass the *number* of draws is load-bearing: one extra draw
+//! moves every number that pass goes on to use. Across passes it is not, because the next reseed
+//! discards the previous pass's state. An approximation of the generator is still no use at all:
+//! each pass's own draws would land on different numbers from the same seed.
 //!
 //! This is the Knuth subtractive generator that .NET's `Random` has always used, which Terraria
 //! copied into `UnifiedRandom` so its worlds would not change when the runtime did. It is
