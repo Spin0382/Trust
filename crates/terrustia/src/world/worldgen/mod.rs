@@ -32,6 +32,7 @@
 //! points that actually check seed text against it; [`build`]/[`generate`] never do.
 
 pub mod cave_flood;
+pub mod caverer;
 pub mod celebration;
 pub mod clay;
 pub mod dead_mans_chest;
@@ -84,6 +85,7 @@ pub mod spider_caves;
 pub mod statue_gen;
 pub mod structure_map;
 pub mod structures;
+pub mod surface_caves;
 pub mod surface_plants;
 pub mod terrain;
 pub mod terrain_pass;
@@ -98,6 +100,7 @@ pub mod underworld_ruins;
 pub mod wall_variety;
 pub mod water_plants;
 pub mod waterfalls;
+pub mod wavy_caves;
 
 pub use passes::compare_against;
 
