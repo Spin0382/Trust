@@ -76,17 +76,19 @@ Two further properties worth knowing:
   whose diamond radius breathes between 60% and 200% of its start as the tunnel runs.
 - `Wavy Caves`, which is a registered no-op: its whole body is gated on the Don't Starve seed, and
   the pass still has to occupy its manifest slot.
+- `Generate Ice Biome`, whose `snowMinX`/`snowMaxX` walk the later ice passes read back, and
+  `Grass`, which converts a dirt pocket only when all four of its neighbours are dirt.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-16/106 recorded passes are implemented, and 16 of those match the reference's draw stream.
+17/106 recorded passes are implemented, and 17 of those match the reference's draw stream.
 every implemented pass matches.
-next to write: "Grass"
+next to write: "Jungle"
 ```
 
-and the tile check below says our world is **identical to vanilla's after each of passes 1 to 8**,
+and the tile check below says our world is **identical to vanilla's after each of passes 1 to 12**,
 in every field a `.wld` can carry.
 
 ### Two oracles, because one is not enough
@@ -155,7 +157,7 @@ shipped server could not send either.
 
 ## What is not
 
-The other 90 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 89 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

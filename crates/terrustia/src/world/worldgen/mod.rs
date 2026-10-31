@@ -49,6 +49,7 @@ pub mod floating_islands;
 pub mod for_the_worthy;
 pub mod gem_caves;
 pub mod genpipe;
+pub mod grass;
 pub mod hive;
 pub mod ice_biome;
 pub mod jungle_shrines;

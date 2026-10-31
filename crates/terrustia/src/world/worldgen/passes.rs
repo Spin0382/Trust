@@ -275,6 +275,10 @@ pub const PASSES: &[Pass] = &[
         name: "Generate Ice Biome",
         run: super::ice_biome::run,
     },
+    Pass {
+        name: "Grass",
+        run: super::grass::run,
+    },
 ];
 
 /// Where a port stopped agreeing with a reference world.
