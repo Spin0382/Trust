@@ -565,4 +565,156 @@ mod tests {
         assert_eq!(outcome.divergences.len(), 1);
         assert!(outcome.divergences[0].name.contains("we have"),);
     }
+
+    /// The stepped reference worlds, found the same way `dunes` finds its reference: by walking
+    /// up from the crate, because a worktree checkout is not at a fixed depth.
+    ///
+    /// Each `stopNNN.wld` is an ordinary dedicated server run with its pass list truncated to
+    /// NNN, so it is vanilla's world exactly as it stands after that many passes. `.scratch` is
+    /// not in the repository and making one needs a local Terraria install, so an absent directory
+    /// skips rather than fails - the same arrangement `vanilla_tests::reference_world` uses.
+    fn stepped_references() -> Vec<(usize, std::path::PathBuf)> {
+        let mut directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf();
+        let dir = loop {
+            let candidate = directory.join(".scratch/oracle");
+            if candidate.is_dir() {
+                break candidate;
+            }
+            if !directory.pop() {
+                return Vec::new();
+            }
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(usize, std::path::PathBuf)> = entries
+            .filter_map(Result::ok)
+            .map(|entry| (entry.path(), entry.file_name()))
+            .filter_map(|(path, name)| {
+                let text = name.to_string_lossy().into_owned();
+                let digits = text
+                    .strip_prefix("stop")?
+                    .strip_suffix(".wld")?
+                    .parse::<usize>()
+                    .ok()?;
+                Some((digits, path))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Reproduce vanilla's world, tile for tile, at every step it can.
+    ///
+    /// This is the strongest check the port has, and it is deliberately not the same check as the
+    /// manifest comparison above. `RandNext` proves a pass drew the right numbers; two passes can
+    /// draw identically while painting different tiles, because a runner's decision to skip a tile
+    /// feeds back into which tiles its successors read. Three separate bugs were found only here:
+    /// `Main.worldSurface` (331) being passed where vanilla reads `GenVars.worldSurface` (267),
+    /// `TileRunner`'s default speeds, and `(int)double.NaN` being `int.MinValue` in .NET rather
+    /// than the 0 Rust's `as` saturates to. None of them moved a draw count.
+    #[test]
+    fn every_stepped_reference_world_is_reproduced_tile_for_tile() {
+        use crate::world::wld;
+
+        let steps = stepped_references();
+        if steps.is_empty() {
+            eprintln!(
+                "no stepped reference worlds in .scratch/oracle; \
+                 skipping the tile-for-tile check (see .scratch/oracle/README.md)"
+            );
+            return;
+        }
+        // One walk, compared after each pass, rather than re-running the whole prefix per step.
+        // The passes are cumulative and the cheap ones are not cheap - Sand Patches draws 2.1
+        // million times and Rock Layer Caves 6.8 million - so a per-step `run_passes` would repeat
+        // all of them for every file in the directory.
+        let total = steps.len();
+        let step: std::collections::BTreeMap<usize, std::path::PathBuf> = steps
+            .into_iter()
+            .filter(|(count, _)| *count <= PASSES.len())
+            .collect();
+        let Some((_, first_path)) = step.iter().next() else {
+            // The same arrangement as `vanilla_tests::reference_world`: the files need a local
+            // install to make, so their absence is reported and skipped rather than failed.
+            eprintln!(
+                "no stepped reference within the {} registered passes ({total} in \
+                 .scratch/oracle); skipping",
+                PASSES.len()
+            );
+            return;
+        };
+        let shape = match wld::load(first_path) {
+            Ok(world) => world,
+            Err(error) => panic!("{} unreadable: {error:?}", first_path.display()),
+        };
+        let widest = step.keys().next_back().copied().unwrap_or(0);
+
+        let mut vars = GenVars::new(
+            12_345,
+            World::empty(shape.width(), shape.height(), &shape.name),
+        );
+        crate::world::worldgen::reset::reset(&mut vars, Some(shape.crimson));
+        let mut checked = 0usize;
+        for (index, pass) in PASSES.iter().enumerate() {
+            vars.rand = UnifiedRandom::new(12_345);
+            (pass.run)(&mut vars);
+            let Some(path) = step.get(&(index + 1)) else {
+                if index + 1 >= widest {
+                    break;
+                }
+                continue;
+            };
+            let reference = match wld::load(path) {
+                Ok(world) => world,
+                Err(error) => panic!("{} unreadable: {error:?}", path.display()),
+            };
+            let mut differences: Vec<String> = Vec::new();
+            for column in 0..reference.width() {
+                for row in 0..reference.height() {
+                    let a = vars.world.tile(column, row);
+                    let b = reference.tile(column, row);
+                    if (a.is_active() != b.is_active()
+                        || a.block != b.block
+                        || a.wall != b.wall
+                        || a.liquid != b.liquid
+                        || a.liquid_kind != b.liquid_kind)
+                        && differences.len() < 8
+                    {
+                        differences.push(format!(
+                            "({column},{row}) ours active={} block={} wall={} liquid={} | \
+                                 theirs active={} block={} wall={} liquid={}",
+                            a.is_active(),
+                            a.block,
+                            a.wall,
+                            a.liquid,
+                            b.is_active(),
+                            b.block,
+                            b.wall,
+                            b.liquid,
+                        ));
+                    }
+                }
+            }
+            assert!(
+                differences.is_empty(),
+                "after {} passes ({:?}) our world differs from vanilla's {}: \
+                 first differences:\n  {}",
+                index + 1,
+                pass.name,
+                path.display(),
+                differences.join("\n  ")
+            );
+            checked += 1;
+            if index + 1 >= widest {
+                break;
+            }
+        }
+        assert_eq!(
+            checked,
+            step.len(),
+            "only {checked} of {} stepped references were reached",
+            step.len()
+        );
+    }
 }

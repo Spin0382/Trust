@@ -77,10 +77,15 @@ Against the reference world (4200x1200, crimson, seed text `12345`) it now repor
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-13/106 recorded passes are implemented, and 12 of those match the reference's draw stream.
+13/106 recorded passes are implemented, and 13 of those match the reference's draw stream.
+every implemented pass matches.
+next to write: "Surface Caves"
 ```
 
-### What the oracle cannot see, and what that costs
+and the tile check below says our world is **identical to vanilla's after each of passes 1 to 5**,
+tile for tile, walls and liquids included.
+
+### Two oracles, because one is not enough
 
 The comparison runs every implemented pass rather than stopping at the first disagreement, because
 each pass is reseeded and its `RandNext` is therefore its own proof. That mattered immediately:
@@ -114,27 +119,34 @@ load path runs from the client's splash screen and calls `MessageBox.Show` - and
 assembly.)
 
 `genparity --passes N --diff <stopped world>` compares what our passes built against what vanilla's
-did, on the surface row, the dirt-to-stone row and the active-tile count per type. First run, and
-what it found:
+did, on the surface row, the dirt-to-stone row, the active-tile count per type and the first
+differing coordinates. `every_stepped_reference_world_is_reproduced_tile_for_tile` is the same
+check as a test: it walks the registry once and asserts total equality with every step file it has.
 
-| step | result |
-| --- | --- |
-| after pass 1 | every column matches: 4200 surfaces, 4200 dirt-to-stone lines, dirt 558,248 and stone 3,448,135 on both sides |
-| after pass 3 | identical except 23 sand tiles that Dunes placed at columns 2968-2976 |
-| after pass 4 | dirt and stone exact, sand +23 - the same 23, nothing new |
+Two of the three bugs it found are invisible to any amount of RNG checking, because neither changes
+a single draw:
 
-So `Terrain` is exact, and the pass-6 Mount Caves failure was not terrain height after all. It was
-a name: `Main.worldSurface` and `GenVars.worldSurface` are different numbers on the same world -
-331 and 267 - and the port had been feeding the `GenVars.` one to passes whose vanilla source reads
-the `Main.` one. Sand Patches picks its depth band from `Main.worldSurface` and `Main.rockLayer`, so
-every patch sat about 64 rows too shallow; Mount Caves walks columns to `Main.worldSurface`; Dirt
-Wall Backgrounds paints to `Main.worldSurface + 10`. None of those mistakes change a draw count, so
-the RNG oracle passed all three while the tiles were wrong.
+- **`Main.worldSurface` and `GenVars.worldSurface` are different numbers on the same world**, 331
+  and 267. The port fed the `GenVars.` one to passes whose source reads `Main.`'s: Sand Patches
+  picks its depth band from `Main.worldSurface` and `Main.rockLayer`, so every patch sat about 64
+  rows too shallow; Mount Caves walks columns to `Main.worldSurface`; Dirt Wall Backgrounds paints
+  to `Main.worldSurface + 10`. `RunnerContext::ordinary` now builds that context in one place.
+- **`(int)double.NaN` is `int.MinValue` in .NET, not 0.** Under a dune's edge the sand depth is
+  `(int)(Math.Sqrt(from_edge) * 3.0)` with `from_edge` negative, so vanilla's floor is a
+  billion-ish rows up and the fill loop never runs. Rust's `as` saturates NaN to 0, which painted a
+  23-tile skirt of sand on the nine columns left of the reference world's largest dune.
 
-`RunnerContext::ordinary` now builds that context in one place, and the passes that read the line
-directly say which of the two they mean. Nine of the ten registered passes match the reference draw
-stream; Rocks In Dirt is 4,125 draws high on 3,448,247, consistent with the 23-tile Dunes
-difference still upstream of it.
+The third was visible to the draw oracle but only as a number: Rocks In Dirt was 4,125 draws long,
+and it is the one pass so far written as `for (int i = 0; (double)i < num; i++)` over a **double**
+count rather than `i < (int)num`. `5,040,000 * 0.00015` evaluates to 755.9999999999999, so vanilla
+runs 756 times and a truncating cast runs 755. The missing band-1 runner was the whole difference,
+and it is why the loop in that pass keeps its bound as an `f64`.
+
+With those three fixed, all thirteen registered passes match the reference draw stream, and the
+tile check is clean through pass 5 - the world after `Terrain`, `Dunes`, `Ocean Sand`,
+`Sand Patches` and `Tunnels` is the one Terraria made, with the same seed, to the tile. Passes 6 and
+7 are matched on draws and provably identical on tiles from that, because their input is identical
+and their draws are; passes 8 to 13 are matched on draws and await their own step files.
 
 ## What is not
 

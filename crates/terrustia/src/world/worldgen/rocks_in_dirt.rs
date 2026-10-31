@@ -60,9 +60,15 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
     let area = f64::from(width) * f64::from(height);
     let mut draws = 0usize;
 
-    // Band 1: stone anywhere from the sky to the low surface line.
-    let attempts = (area * 0.00015) as i32;
-    for _ in 0..attempts {
+    // The attempt counts are kept as doubles and compared as `i < num`, because that is what the
+    // original does (`for (int i = 0; (double)i < num; i++)`) and it is not the same as iterating
+    // to `(int)num`: `5,040,000 * 0.00015` is 755.9999999999999, so the loop runs 756 times and a
+    // truncating cast runs 755. This is the only pass so far that reads that way, and the missing
+    // runner is exactly the 4,125 draws its `RandNext` was off by.
+    let mut index = 0i32;
+    let attempts = area * 0.00015;
+    while f64::from(index) < attempts {
+        index += 1;
         let x = rng.next_range(0, width);
         let y = rng.next_range(0, surface_low + 1);
         let strength = f64::from(rng.next_range(4, 15));
@@ -71,8 +77,10 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
     }
 
     // Band 2: the surface band, rerolled once when the spot is too close to the sky.
-    let attempts = (area * 0.0002) as i32;
-    for _ in 0..attempts {
+    let mut index = 0i32;
+    let attempts = area * 0.0002;
+    while f64::from(index) < attempts {
+        index += 1;
         let x = rng.next_range(0, width);
         let mut y = rng.next_range(surface_low, surface_high + 1);
         if !world.tile(x, y - 10).is_active() {
@@ -84,8 +92,10 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
     }
 
     // Band 3: the craggy stone between the surface and the rock layer.
-    let attempts = (area * 0.0045) as i32;
-    for _ in 0..attempts {
+    let mut index = 0i32;
+    let attempts = area * 0.0045;
+    while f64::from(index) < attempts {
+        index += 1;
         let x = rng.next_range(0, width);
         let y = rng.next_range(surface_high, rock_high + 1);
         let strength = f64::from(rng.next_range(2, 7));

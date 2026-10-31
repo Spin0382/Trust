@@ -488,8 +488,21 @@ mod vanilla {
             }
             last = point;
 
+            // Outside the dune's half-width `from_edge` is negative, and vanilla does not clamp
+            // it: `Math.Sqrt` of a negative is NaN, and `(int)double.NaN` on x86-64 .NET is
+            // `int.MinValue` - the integer-indeterminate result of the truncating conversion - not
+            // the 0 that Rust's saturating `as` gives. The floor then sits two billion rows above
+            // the surface, so the fill loop below never runs and the curve's overhang beyond the
+            // dune's own area paints no sand at all. The ten-tile clear above it still happens,
+            // which is why this reads as a missing skirt rather than a missing hill: 23 tiles of
+            // sand on the nine columns left of the reference world's largest dune.
             let from_edge = dune.area.width / 2 - (point.0 - dune.center_x()).abs();
-            let floor = dune.surface.at(point.0) + ((from_edge as f64).sqrt() * 3.0) as i32;
+            let taper = if from_edge < 0 {
+                i32::MIN
+            } else {
+                ((from_edge as f64).sqrt() * 3.0) as i32
+            };
+            let floor = dune.surface.at(point.0).wrapping_add(taper);
 
             for y in point.1 - 10..point.1 {
                 let tile = world.tile(point.0, y);
@@ -875,9 +888,16 @@ fn place_curved_line(
         }
         last = Some(point);
 
-        // Depth tapers toward the dune's edges.
+        // Depth tapers toward the dune's edges. Outside them the taper is `(int)NaN`, which .NET
+        // evaluates to `int.MinValue`, so the fill loop never runs; see `vanilla`'s copy of this
+        // function for the full reason and the tile evidence.
         let from_edge = dune.area.width / 2 - (point.0 - dune.center_x()).abs();
-        let floor = dune.surface.at(point.0) + (f64::from(from_edge.max(0)).sqrt() * 3.0) as i32;
+        let taper = if from_edge < 0 {
+            i32::MIN
+        } else {
+            (f64::from(from_edge).sqrt() * 3.0) as i32
+        };
+        let floor = dune.surface.at(point.0).wrapping_add(taper);
 
         for y in point.1 - 10..point.1 {
             let t = world.tile(point.0, y);

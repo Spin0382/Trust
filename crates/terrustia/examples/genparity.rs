@@ -223,6 +223,34 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
     for (delta, t, a, b) in rows.iter().take(12) {
         println!("    type {t:>3}  ours {a:>8}  theirs {b:>8}  {delta:+}");
     }
+    // Then where, not just how many. An aggregate says a pass is wrong; the positions say which
+    // branch of it is, and a small difference is usually all inside one structure - one hill, one
+    // patch, one pyramid - that a coordinate pair identifies.
+    let mut spots: Vec<String> = Vec::new();
+    'outer: for column in 0..width {
+        for row in 0..height {
+            let a = ours.tile(column, row);
+            let b = theirs.tile(column, row);
+            let ours_block = if a.is_active() { a.block } else { 0 };
+            let theirs_block = if b.is_active() { b.block } else { 0 };
+            if ours_block != theirs_block || a.wall != b.wall {
+                spots.push(format!(
+                    "({column},{row}) block {ours_block:>3}->{theirs_block:<3} wall {}->{}",
+                    a.wall, b.wall
+                ));
+                if spots.len() >= 14 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    println!("  first differing tiles (ours->theirs):");
+    if spots.is_empty() {
+        println!("    none - the two worlds are identical");
+    }
+    for spot in &spots {
+        println!("    {spot}");
+    }
 }
 
 fn main() -> ExitCode {
