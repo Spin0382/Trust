@@ -70,12 +70,14 @@ Two further properties worth knowing:
   make the reference world's dunes tile-for-tile.
 - `Ocean Sand`, `Sand Patches` and `Tunnels`, on the shared `WorldGen.TileRunner` port.
 - `Mount Caves`, `Dirt Wall Backgrounds`, `Rocks In Dirt`, `Dirt In Rocks` and `Clay`.
+- `Small Holes`, `Dirt Layer Caves` and `Rock Layer Caves`, on the carving half of `TileRunner`
+  that the layer passes did not need.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-10/106 recorded passes are implemented, and 9 of those match the reference's draw stream.
+13/106 recorded passes are implemented, and 12 of those match the reference's draw stream.
 ```
 
 ### What the oracle cannot see, and what that costs
@@ -136,7 +138,7 @@ difference still upstream of it.
 
 ## What is not
 
-The other 96 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 93 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

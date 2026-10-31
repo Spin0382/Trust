@@ -238,6 +238,18 @@ pub const PASSES: &[Pass] = &[
         name: "Clay",
         run: super::clay::run,
     },
+    Pass {
+        name: "Small Holes",
+        run: super::small_holes::run,
+    },
+    Pass {
+        name: "Dirt Layer Caves",
+        run: super::dirt_layer_caves::run,
+    },
+    Pass {
+        name: "Rock Layer Caves",
+        run: super::rock_layer_caves::run,
+    },
 ];
 
 /// Where a port stopped agreeing with a reference world.

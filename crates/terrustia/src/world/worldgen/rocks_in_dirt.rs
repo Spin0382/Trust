@@ -26,7 +26,7 @@ use super::rand::UnifiedRandom;
 use super::tile_runner::{RunnerContext, tile_runner};
 
 /// `TileRunner`'s `type` for stone.
-const STONE: u16 = 1;
+const STONE: i32 = 1;
 
 /// A generator that also counts its draws.
 struct Draws<'a> {

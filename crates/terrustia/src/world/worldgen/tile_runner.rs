@@ -159,6 +159,19 @@ fn tile_stone(block: u16) -> bool {
     matches!(block, 63 | 64 | 65 | 66 | 67 | 68 | 130 | 131 | 566)
 }
 
+/// `TileID.Sand`, the one tile a carving runner is told never to remove.
+const SAND: u16 = 53;
+
+/// `Tile.liquidType(num)`, the number the game uses for a liquid.
+fn liquid_from_num(num: i32) -> terrustia_proto::Liquid {
+    match num {
+        1 => terrustia_proto::Liquid::Lava,
+        2 => terrustia_proto::Liquid::Honey,
+        3 => terrustia_proto::Liquid::Shimmer,
+        _ => terrustia_proto::Liquid::Water,
+    }
+}
+
 /// `System.Drawing.Rectangle` as the generation code uses it: an origin and a size, exclusive on
 /// the far edge.
 #[derive(Clone, Copy, Default)]
@@ -186,6 +199,9 @@ pub struct RunnerContext {
     /// on a small world, and `TileRunner` reads the `Main.` one in its sand and wall branches.
     pub world_surface: f64,
     pub water_line: i32,
+    /// `GenVars.lavaLine`, the depth below which a carved hole fills with lava instead of the
+    /// column's usual liquid.
+    pub lava_line: i32,
     /// `GenVars.UndergroundDesertLocation`, empty until the Desert biome pass fills it in. Only
     /// the mud (59) runner branch reads it, so every pass ported so far sees it empty and the same
     /// either way.
@@ -201,15 +217,19 @@ impl RunnerContext {
         Self {
             world_surface: f64::from(vars.world.surface),
             water_line: vars.water_line,
+            lava_line: vars.lava_line,
             underground_desert: Rect::default(),
         }
     }
 }
 
-/// `WorldGen.TileRunner` for the ordinary-world path, type >= 0 only.
+/// `WorldGen.TileRunner` for the ordinary-world path.
 ///
 /// Returns the number of RNG draws taken, so a pass can check its own total against the manifest.
+/// A negative `tile_type` carves: `-1` removes the tile, `-2` also leaves liquid behind.
 /// `add_tile` false rewrites existing types; true also activates the tile and clears its liquid.
+/// The `drunk`/`remix`/`Don't Starve` branches are not modelled, and neither is the 367/368 wall
+/// halo, which is called out where it would belong.
 #[allow(clippy::too_many_arguments)]
 pub fn tile_runner(
     world: &mut World,
@@ -219,7 +239,7 @@ pub fn tile_runner(
     j: i32,
     strength: f64,
     steps: i32,
-    tile_type: u16,
+    tile_type: i32,
     add_tile: bool,
     speed_x: f64,
     speed_y: f64,
@@ -255,9 +275,18 @@ pub fn tile_runner(
         vx = speed_x;
         vy = speed_y;
     }
-    let clear_slope = !save_slope(tile_type);
-    // The `lost` liquid kind. Ordinary worlds leave it at water; the draw still happens.
-    let _liquid_kind = next_max!(4);
+    // `flag`: `type >= 0 && !TileID.Sets.SaveSlopes[type]`. A carving runner has no type to look
+    // up, so it never clears a slope.
+    let clear_slope = tile_type >= 0 && !save_slope(tile_type as u16);
+    // `num3`, the liquid a carved hole fills with. Vanilla picks it from the seed flags: the
+    // `Next(3)` branch belongs to the Don't Starve world and the `Next(4)` one to a "good" world,
+    // and an ordinary seed takes neither, so the value is water while the draw is still consumed.
+    let mut liquid_kind = 0i32;
+    if next_max!(4) == 0 {
+        // `getGoodWorldGen` is false outside the drunk/anniversary/remix combinations, so nothing
+        // changes here yet; the draw is the point.
+        liquid_kind = 0;
+    }
 
     while num > 0.0 && num2 > 0.0 {
         num = strength * (num2 / f64::from(steps));
@@ -268,6 +297,13 @@ pub fn tile_runner(
         let y1 = ((py + num * 0.5) as i32).min(world.height() - 1);
 
         for k in x0..x1 {
+            // Vanilla resets the liquid kind once per column, before the row loop: a hole dug
+            // within `beachDistance + 50` of either edge fills with water whatever the seed picked.
+            // Being outside the row loop it fires for every column of the box, not only the ones
+            // whose first tile passes the jitter test.
+            if k < BEACH_DISTANCE + 50 || k >= world.width() - BEACH_DISTANCE - 50 {
+                liquid_kind = 0;
+            }
             for l in y0..y1 {
                 let tile = world.tile(k, l);
                 if (tile.is_active() && frame_important(tile.block) && !tile_cut(tile.block))
@@ -282,17 +318,40 @@ pub fn tile_runner(
                 {
                     continue;
                 }
-                if k < BEACH_DISTANCE + 50 || k >= world.width() - BEACH_DISTANCE - 50 {
-                    // Vanilla resets its liquid type here; for the type >= 0 path this has no
-                    // observable effect beyond the reset itself.
-                }
                 let mut tile = world.tile(k, l);
+                if tile_type < 0 {
+                    // The carving path (`WorldGen.cs:77795-77820`). A runner never digs through
+                    // sand, and `-2` means "leave liquid behind": a hole outside the lava line is
+                    // filled to the brim with the column's liquid kind, and anything at or below
+                    // the lava line turns to lava. The tile keeps its type - only `active` goes.
+                    if tile.is_active() && tile.block == SAND {
+                        continue;
+                    }
+                    if tile_type == -2
+                        && tile.is_active()
+                        && (l < ctx.water_line || l > ctx.lava_line)
+                    {
+                        tile.liquid = u8::MAX;
+                        tile.liquid_kind = liquid_from_num(liquid_kind);
+                        if l > ctx.lava_line {
+                            tile.liquid_kind = terrustia_proto::Liquid::Lava;
+                        }
+                    }
+                    tile.flags.set(terrustia_proto::TileFlags::ACTIVE, false);
+                    world.set_tile(k, l, tile);
+                    continue;
+                }
+                // Not ported: vanilla's `flag2`/`flag3`, which place wall 180 or 178 in a box
+                // around the runner when its type is 368 or 367. Each of those consumes a
+                // `Next(-10, 11)` per visited tile, so a pass with either type will diverge here.
+                // No pass in the manifest up to Small Holes uses them; `Spider Caves` (367) and the
+                // honey paths (368) are where this has to be finished.
                 let mut skip = false;
                 if over_ride && tile.is_active() {
-                    skip = override_skip(&tile, tile_type, k, l, ctx, rand);
+                    skip = override_skip(&tile, tile_type as u16, k, l, ctx, rand);
                 }
                 if !skip {
-                    tile.block = tile_type;
+                    tile.block = tile_type as u16;
                     if clear_slope {
                         tile.slope = 0;
                         tile.flags

@@ -18,8 +18,8 @@ use super::passes::GenVars;
 use super::rand::UnifiedRandom;
 use super::tile_runner::{RunnerContext, tile_runner};
 
-/// `TileID.Clay`.
-const CLAY: u16 = 40;
+/// `TileID.Clay`, as `TileRunner` takes it.
+const CLAY: i32 = 40;
 /// `TileID.Dirt`, what the surface cleanup rewrites clay to.
 const DIRT: u16 = 0;
 
@@ -97,7 +97,7 @@ pub fn run_counted(vars: &mut GenVars) -> usize {
             if world.tile(column, row).is_active() {
                 for clay_row in row..row + 5 {
                     let mut tile = world.tile(column, clay_row);
-                    if tile.block == CLAY {
+                    if i32::from(tile.block) == CLAY {
                         tile.block = DIRT;
                         world.set_tile(column, clay_row, tile);
                     }

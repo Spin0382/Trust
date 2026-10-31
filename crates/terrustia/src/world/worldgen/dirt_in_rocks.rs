@@ -17,7 +17,7 @@ use super::rand::UnifiedRandom;
 use super::tile_runner::{RunnerContext, tile_runner};
 
 /// `TileRunner`'s `type` for dirt.
-const DIRT: u16 = 0;
+const DIRT: i32 = 0;
 
 /// A generator that also counts its draws.
 struct Draws<'a> {
