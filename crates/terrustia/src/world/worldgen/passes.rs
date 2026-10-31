@@ -115,6 +115,10 @@ pub struct GenVars {
     /// `GenVars.tunnelX`/`numTunnels`: the surface tunnels' centre columns.
     pub tunnel_x: Vec<i32>,
     pub num_tunnels: usize,
+    /// `GenVars.mCaveX`/`mCaveY`/`numMCaves`: the mountain caves' entry columns and rows.
+    pub mount_cave_x: Vec<i32>,
+    pub mount_cave_y: Vec<i32>,
+    pub num_mount_caves: usize,
 }
 
 impl GenVars {
@@ -174,6 +178,9 @@ impl GenVars {
             num_pyr: 0,
             tunnel_x: vec![0; 50],
             num_tunnels: 0,
+            mount_cave_x: vec![0; 30],
+            mount_cave_y: vec![0; 30],
+            num_mount_caves: 0,
         }
     }
 }
@@ -211,6 +218,14 @@ pub const PASSES: &[Pass] = &[
         name: "Tunnels",
         run: super::tunnels::run,
     },
+    Pass {
+        name: "Mount Caves",
+        run: super::mount_caves::run,
+    },
+    Pass {
+        name: "Dirt Wall Backgrounds",
+        run: super::dirt_wall_backgrounds::run,
+    },
 ];
 
 /// Where a port stopped agreeing with a reference world.
@@ -225,9 +240,50 @@ pub struct Divergence {
 /// What a comparison found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
-    /// How many passes were run and checked.
+    /// How many implemented passes were run and checked.
     pub checked: usize,
-    pub first_divergence: Option<Divergence>,
+    /// How many of those read the generator exactly as the reference did.
+    pub matches: usize,
+    /// Every pass that did not, in order.
+    ///
+    /// The comparison does not stop at the first one. Each pass is reseeded from the world seed,
+    /// so a pass's `RandNext` says about *that* pass alone, and a pass that matches is proven even
+    /// when its neighbour does not. That is what makes a tile-independent pass checkable while the
+    /// terrain before it is still wrong.
+    pub divergences: Vec<Divergence>,
+}
+
+impl Outcome {
+    /// The first pass that stopped matching, if any.
+    pub fn first_divergence(&self) -> Option<&Divergence> {
+        self.divergences.first()
+    }
+}
+
+/// Run the first `count` implemented passes on a fresh world and hand back what they built.
+///
+/// This is the same driver [`compare_against`] uses, minus the comparison, and it exists because a
+/// pass whose *draw count* depends on the tiles it reads can only be debugged by looking at those
+/// tiles. The manifest says whether a pass is wrong; this says what it actually made.
+///
+/// `count` beyond [`PASSES`] simply stops at the end of the registry.
+pub fn run_passes(
+    seed: i32,
+    width: i32,
+    height: i32,
+    name: &str,
+    crimson: bool,
+    count: usize,
+) -> World {
+    let mut world = World::empty(width, height, name);
+    world.crimson = crimson;
+    let mut vars = GenVars::new(seed, world);
+    super::reset::reset(&mut vars, Some(crimson));
+    for pass in PASSES.iter().take(count) {
+        vars.rand = UnifiedRandom::new(seed);
+        (pass.run)(&mut vars);
+    }
+    vars.world
 }
 
 /// Run the implemented passes against a reference world's record.
@@ -255,45 +311,51 @@ pub fn compare_against(manifest: &Manifest, seed: i32, reference: &World) -> Out
 /// The comparison itself, with the pass registry injectable so its tests can use a stand-in.
 fn compare_with(manifest: &Manifest, seed: i32, vars: &mut GenVars, passes: &[Pass]) -> Outcome {
     let mut checked = 0;
+    let mut matches = 0;
+    let mut divergences = Vec::new();
     for (index, expected) in manifest.ran().enumerate() {
         let Some(pass) = passes.get(index) else {
             break;
         };
         if pass.name != expected.name {
+            // A name out of place means every later index is lined up against the wrong entry, so
+            // there is nothing further worth comparing. This is the one case that has to stop.
+            divergences.push(Divergence {
+                index,
+                name: format!("{} (we have {:?} here)", expected.name, pass.name),
+                expected: expected.rand_next,
+                got: -1,
+            });
             return Outcome {
                 checked,
-                first_divergence: Some(Divergence {
-                    index,
-                    name: format!("{} (we have {:?} here)", expected.name, pass.name),
-                    expected: expected.rand_next,
-                    got: -1,
-                }),
+                matches,
+                divergences,
             };
         }
         // `WorldGenerator.RunPass` starts every pass from the world's seed
-        // (`WorldGenerator.cs:499`), so a port that does not reseed here is comparing the wrong
+        // (`WorldGen.cs:499`), so a port that does not reseed here is comparing the wrong
         // stream from the first pass onward.
         vars.rand = UnifiedRandom::new(seed);
         (pass.run)(vars);
         // The game samples the generator here, and the sample itself advances it — so a port has
         // to take one at the same point or it diverges from the very first pass.
         let got = i64::from(vars.rand.next());
-        if got != expected.rand_next {
-            return Outcome {
-                checked,
-                first_divergence: Some(Divergence {
-                    index,
-                    name: expected.name.clone(),
-                    expected: expected.rand_next,
-                    got,
-                }),
-            };
-        }
         checked += 1;
+        if got == expected.rand_next {
+            matches += 1;
+        } else {
+            divergences.push(Divergence {
+                index,
+                name: expected.name.clone(),
+                expected: expected.rand_next,
+                got,
+            });
+        }
     }
     Outcome {
         checked,
-        first_divergence: None,
+        matches,
+        divergences,
     }
 }
 
@@ -324,7 +386,7 @@ mod tests {
         let mut vars = GenVars::new(42, World::empty(600, 400, "ours"));
         let outcome = compare_with(&manifest, 42, &mut vars, &[]);
         assert_eq!(outcome.checked, 0);
-        assert!(outcome.first_divergence.is_none());
+        assert!(outcome.first_divergence().is_none());
     }
 
     /// The sample the game takes after each pass advances the generator, so a port that runs a
@@ -344,7 +406,7 @@ mod tests {
         let mut vars = GenVars::new(42, World::empty(600, 400, "ours"));
         let outcome = compare_with(&manifest, 42, &mut vars, &passes);
         assert_eq!(outcome.checked, 1);
-        assert!(outcome.first_divergence.is_none());
+        assert!(outcome.first_divergence().is_none());
     }
 
     /// Each pass starts from the seed rather than from whatever the last one left, which is what
@@ -373,7 +435,7 @@ mod tests {
         let outcome = compare_with(&manifest, 42, &mut vars, &passes);
         assert_eq!(outcome.checked, 2);
         assert!(
-            outcome.first_divergence.is_none(),
+            outcome.first_divergence().is_none(),
             "the second pass did not start from the seed"
         );
     }
@@ -396,7 +458,7 @@ mod tests {
         let mut vars = GenVars::new(42, World::empty(600, 400, "ours"));
         let outcome = compare_with(&manifest, 42, &mut vars, &passes);
         let diverged = outcome
-            .first_divergence
+            .first_divergence()
             .expect("an extra draw must be caught");
         assert_eq!(diverged.name, "Terrain");
         assert_eq!(diverged.index, 0);
@@ -404,5 +466,79 @@ mod tests {
             diverged.got, expected,
             "an extra draw has to change what comes next, or the oracle is worthless"
         );
+    }
+
+    /// Each pass is reseeded, so a wrong pass does not invalidate the one after it and the
+    /// comparison keeps going. Without this, one broken pass hides every later pass that is
+    /// already right, which is exactly the state the port is in while the terrain is still off:
+    /// a pass that draws once per column regardless of tiles cannot be checked at all if the
+    /// walk stops at the pass before it.
+    #[test]
+    fn a_diverging_pass_does_not_stop_the_later_ones_being_checked() {
+        fn one_draw(vars: &mut GenVars) {
+            vars.rand.next_max(10);
+        }
+        fn wrong(vars: &mut GenVars) {
+            vars.rand.next_max(10);
+            vars.rand.next_max(10);
+        }
+        // The reference's own values, each taken from the stream position that a correct pass
+        // would leave the generator at. The middle entry is what a pass drawing three numbers
+        // reads, while our stand-in draws two, so only that one disagrees.
+        let mut r = UnifiedRandom::new(42);
+        r.next_max(10);
+        let after_one = i64::from(r.next());
+        let mut r = UnifiedRandom::new(42);
+        for _ in 0..3 {
+            r.next_max(10);
+        }
+        let after_three = i64::from(r.next());
+        let manifest = manifest_of(&[
+            ("First", after_one),
+            ("Second", after_three),
+            ("Third", after_one),
+        ]);
+        let passes = [
+            Pass {
+                name: "First",
+                run: one_draw,
+            },
+            Pass {
+                name: "Second",
+                run: wrong,
+            },
+            Pass {
+                name: "Third",
+                run: one_draw,
+            },
+        ];
+        let mut vars = GenVars::new(42, World::empty(600, 400, "ours"));
+        let outcome = compare_with(&manifest, 42, &mut vars, &passes);
+        assert_eq!(outcome.checked, 3);
+        assert_eq!(outcome.matches, 2);
+        assert_eq!(outcome.divergences.len(), 1);
+        assert_eq!(outcome.divergences[0].name, "Second");
+    }
+
+    /// A registry that is out of step with the manifest stops rather than comparing every later
+    /// pass against the wrong entry.
+    #[test]
+    fn a_misordered_registry_stops_instead_of_mismatching_everything() {
+        let manifest = manifest_of(&[("First", 1), ("Second", 2)]);
+        let passes = [
+            Pass {
+                name: "Second",
+                run: |_: &mut GenVars| {},
+            },
+            Pass {
+                name: "First",
+                run: |_: &mut GenVars| {},
+            },
+        ];
+        let mut vars = GenVars::new(42, World::empty(600, 400, "ours"));
+        let outcome = compare_with(&manifest, 42, &mut vars, &passes);
+        assert_eq!(outcome.checked, 0);
+        assert_eq!(outcome.divergences.len(), 1);
+        assert!(outcome.divergences[0].name.contains("we have"),);
     }
 }

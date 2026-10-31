@@ -19,7 +19,132 @@
 
 use std::{env, process::ExitCode};
 
-use terrustia::world::{wld, worldgen::manifest::Manifest, worldgen::rand::translate_seed};
+use terrustia::world::{
+    wld,
+    worldgen::manifest::Manifest,
+    worldgen::rand::{UnifiedRandom, translate_seed},
+};
+
+/// How many draws a pass took, given the value its generator was sampled at afterwards.
+///
+/// Every pass starts from the same reseeded stream (`WorldGenerator.cs:499`), so the recorded
+/// `RandNext` is just the stream's value at index `k`, where `k` is how many numbers the pass
+/// consumed. Walking the stream finds that index, which turns the manifest's single fingerprint
+/// into a draw count. Returns `None` when the value is not in the first `limit` positions, either
+/// because the pass drew more than that or because it drew nothing at all in a way that only the
+/// pass itself can explain.
+fn draw_count(seed: i32, value: i64, limit: usize) -> Option<usize> {
+    let mut rand = UnifiedRandom::new(seed);
+    for index in 0..=limit {
+        if i64::from(rand.next()) == value {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// The value following a flag in the command line.
+fn arg_after(flag: &str) -> Option<String> {
+    env::args()
+        .position(|arg| arg == flag)
+        .and_then(|i| env::args().nth(i + 1))
+}
+
+/// Compare two worlds column by column on where their ground starts.
+///
+/// The draw stream says whether a pass asked for the right numbers; this says whether it was
+/// looking at the right world while it asked. The surface row is what most later passes branch on
+/// - `Mount Caves` screens a 100 by 50 box around the first solid tile in its column, so a
+/// surface a few rows out silently changes how many caves get dug.
+///
+/// `theirs` is normally a vanilla world stopped at the same pass count. Comparing against the
+/// *finished* vanilla world instead is misleading: forty passes of caves, grass and trees sit on
+/// top of the surface line by then.
+fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World, label: &str) {
+    use std::collections::HashMap;
+
+    let width = ours.width().min(theirs.width());
+    let height = ours.height().min(theirs.height());
+    let surface_of = |world: &terrustia::world::World, column: i32| -> i32 {
+        for row in 0..height {
+            if world.tile(column, row).is_active() {
+                return row;
+            }
+        }
+        height
+    };
+    let mut deltas: Vec<i32> = Vec::with_capacity(width as usize);
+    for column in 0..width {
+        deltas.push(surface_of(ours, column) - surface_of(theirs, column));
+    }
+    let histogram = |world: &terrustia::world::World| {
+        let mut counts: HashMap<u16, u64> = HashMap::new();
+        for column in 0..width {
+            for row in 0..height {
+                let tile = world.tile(column, row);
+                if tile.is_active() {
+                    *counts.entry(tile.block).or_default() += 1;
+                }
+            }
+        }
+        counts
+    };
+    let counts_ours = histogram(ours);
+    let counts_theirs = histogram(theirs);
+    let equal = deltas.iter().filter(|d| **d == 0).count();
+    let abs: Vec<i64> = deltas.iter().map(|d| i64::from(*d).abs()).collect();
+    let columns = abs.len().max(1);
+    let mean = abs.iter().sum::<i64>() as f64 / columns as f64;
+    let mut sorted = abs.clone();
+    sorted.sort_unstable();
+    println!("tile diff against {label}:");
+    println!(
+        "  surface within 0 rows: {}/{} columns ({:.1}%)",
+        equal,
+        columns,
+        100.0 * equal as f64 / columns as f64
+    );
+    println!(
+        "  mean |delta| {mean:.1} rows, median {}, p90 {}, worst {}",
+        sorted[columns / 2],
+        sorted[columns * 9 / 10],
+        sorted[columns - 1]
+    );
+    let mut worst: Vec<(i64, i32)> = abs
+        .iter()
+        .copied()
+        .zip(0..i32::try_from(columns).unwrap_or(0))
+        .filter(|(d, _)| *d > 0)
+        .collect();
+    worst.sort_by(|a, b| b.0.cmp(&a.0));
+    let top: Vec<String> = worst
+        .iter()
+        .take(8)
+        .map(|(d, column)| format!("col {column} {d:+}"))
+        .collect();
+    println!("  furthest columns: {}", top.join(", "));
+    // The tile mix, so a pass that writes the wrong block is obvious even when the surface agrees.
+    let mut types: Vec<u16> = counts_ours
+        .keys()
+        .chain(counts_theirs.keys())
+        .copied()
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    let mut rows: Vec<(i64, u16, u64, u64)> = types
+        .iter()
+        .map(|t| {
+            let a = counts_ours.get(t).copied().unwrap_or(0);
+            let b = counts_theirs.get(t).copied().unwrap_or(0);
+            (i64::try_from(a.saturating_sub(b)).unwrap_or(0), *t, a, b)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.abs().cmp(&a.0.abs()));
+    println!("  active tiles by type (ours, theirs, largest gap first):");
+    for (delta, t, a, b) in rows.iter().take(12) {
+        println!("    type {t:>3}  ours {a:>8}  theirs {b:>8}  {delta:+}");
+    }
+}
 
 fn main() -> ExitCode {
     let Some(path) = env::args().nth(1) else {
@@ -54,6 +179,11 @@ fn main() -> ExitCode {
     };
 
     let seed = translate_seed(&world.seed_text);
+    // An optional `--save PATH` writes the world the implemented passes actually built. The
+    // manifest says whether a pass drew right; only the tiles say why, and a pass that branches on
+    // what it reads (Mount Caves screens for sand before it digs) diverges in its draw count when
+    // an earlier pass got the tiles wrong.
+    let save_at = arg_after("--save");
     println!("reference: {}", path);
     println!(
         "  world     {} ({}x{})",
@@ -89,47 +219,97 @@ fn main() -> ExitCode {
 
     // Run the port as far as it goes, and compare pass by pass.
     let outcome = terrustia::world::worldgen::compare_against(&manifest, seed, &world);
-    match outcome.first_divergence {
-        None if outcome.checked == 0 => {
-            println!("no passes are implemented yet, so nothing was checked.");
-            println!(
-                "the first to write is {:?}, whose generator should read {} afterwards.",
-                manifest
-                    .passes
-                    .first()
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("?"),
-                manifest.passes.first().map(|p| p.rand_next).unwrap_or(0),
-            );
-            ExitCode::SUCCESS
-        }
-        None => {
-            println!(
-                "all {} implemented passes match the reference.",
-                outcome.checked
-            );
-            if outcome.checked < manifest.ran().count() {
-                let next = manifest.ran().nth(outcome.checked);
-                println!(
-                    "next to write: {:?}",
-                    next.map(|p| p.name.as_str()).unwrap_or("?")
-                );
+    let diff_at = arg_after("--diff");
+    if save_at.is_some() || diff_at.is_some() {
+        let passes = terrustia::world::worldgen::passes::PASSES;
+        let built = terrustia::world::worldgen::passes::run_passes(
+            seed,
+            world.width(),
+            world.height(),
+            &world.name,
+            world.crimson,
+            passes.len(),
+        );
+        if let Some(out) = save_at {
+            match terrustia::world::wld_save::serialize(&built) {
+                Ok(bytes) => match std::fs::write(&out, &bytes) {
+                    Ok(()) => {
+                        eprintln!("saved the world our {} passes built to {out}", passes.len());
+                    }
+                    Err(e) => eprintln!("could not write {out}: {e}"),
+                },
+                Err(e) => eprintln!("could not serialize: {e}"),
             }
-            ExitCode::SUCCESS
         }
-        Some(diverged) => {
-            println!(
-                "first divergence at pass {}: {:?}",
-                diverged.index + 1,
-                diverged.name
-            );
-            println!("  reference generator reads {}", diverged.expected);
-            println!("  ours reads               {}", diverged.got);
-            println!();
-            println!("every pass before it matches, so that pass is the one that is wrong.");
-            println!("a difference here is a difference in how many numbers it drew, or in what");
-            println!("order — not necessarily in the tiles it wrote.");
-            ExitCode::FAILURE
+        if let Some(other) = diff_at {
+            let bytes = match std::fs::read(&other) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    eprintln!("could not read {other}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match wld::parse(&bytes) {
+                Ok(reference) => diff_worlds(&built, &reference, &other),
+                Err(e) => eprintln!("could not parse {other}: {e}"),
+            }
         }
     }
+    let total = manifest.ran().count();
+    if outcome.checked == 0 {
+        println!("no passes are implemented yet, so nothing was checked.");
+        println!(
+            "the first to write is {:?}, whose generator should read {} afterwards.",
+            manifest
+                .passes
+                .first()
+                .map(|p| p.name.as_str())
+                .unwrap_or("?"),
+            manifest.passes.first().map(|p| p.rand_next).unwrap_or(0),
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{}/{} recorded passes are implemented, and {} of those match the reference's draw stream.",
+        outcome.checked, total, outcome.matches
+    );
+    let limit = 400_000;
+    for diverged in &outcome.divergences {
+        println!();
+        println!("pass {}: {:?}", diverged.index + 1, diverged.name);
+        println!("  reference generator reads {}", diverged.expected);
+        println!("  ours reads               {}", diverged.got);
+        // Both values are positions in the same reseeded stream, so turning them back into
+        // indices says how far apart the two passes are, not merely that they differ.
+        if let Some(want) = draw_count(seed, diverged.expected, limit) {
+            println!("  reference drew {want} numbers in this pass");
+            if let Some(got) = draw_count(seed, diverged.got, limit) {
+                println!(
+                    "  ours drew      {got}  ({:+} relative to the reference)",
+                    got as i64 - want as i64
+                );
+            }
+            // The reference's own draws, which say what the pass picked rather than only how many
+            // times it asked. The first few are usually enough to spot a wrong branch.
+            let show = want.min(24);
+            let mut rand = UnifiedRandom::new(seed);
+            let draws: Vec<i32> = (0..show).map(|_| rand.next()).collect();
+            println!("  its first {show} draws: {draws:?}");
+        }
+    }
+    if outcome.divergences.is_empty() {
+        println!("every implemented pass matches.");
+    } else {
+        println!();
+        println!("a divergence is a difference in how many numbers a pass drew, or in what order");
+        println!(
+            "- not necessarily in the tiles it wrote. The passes that match are proven anyway:"
+        );
+        println!("each one is reseeded from the world's seed, so its fingerprint is its own.");
+        return ExitCode::FAILURE;
+    }
+    if let Some(next) = manifest.ran().nth(outcome.checked) {
+        println!("next to write: {:?}", next.name);
+    }
+    ExitCode::SUCCESS
 }

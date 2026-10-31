@@ -387,7 +387,7 @@ mod tests {
         let mut reference = World::empty(4200, 1200, "reference");
         reference.crimson = true;
         let outcome = compare_against(&manifest, 12_345, &reference);
-        assert_eq!(outcome.first_divergence, None);
+        assert!(outcome.divergences.is_empty());
         assert_eq!(outcome.checked, 1);
     }
 }

@@ -48,7 +48,8 @@ Two further properties worth knowing:
   and seven sequences match a second implementation written separately from the same source.
 - `TranslateSeed`: parse as an integer, else CRC32.
 - The manifest reader, hand-written to avoid a JSON dependency.
-- `genparity`, which reads a reference world's seed and pass record and names the first divergence.
+- `genparity`, which reads a reference world's seed and pass record and reports every implemented
+  pass against it, with the reference's draw count and first draws for any that disagree.
 - `WorldGen.Reset` for an ordinary world: the seed's draws up to the first pass, including the
   tree, cave and background styles, moon, ore tiers, dungeon side and column, jungle and snow
   origins, and both beach ends. Every value it produces for the reference world matches that
@@ -56,18 +57,40 @@ Two further properties worth knowing:
 - `TerrainPass`, the first pass: all five surface shapes, `SurfaceHistory`, the surface and rock
   layer calculations, `FillColumn`, `RetargetColumn`, `RetargetSurfaceHistory`,
   `GenerateWorldSurfaceOffset`, and the beach padding (`FlatBeachPadding = 5`).
+- `Dunes`, which is `DunesBiome.Place`: the sand hills, the pyramid sites, and the 112 draws that
+  make the reference world's dunes tile-for-tile.
+- `Ocean Sand`, `Sand Patches` and `Tunnels`, on the shared `WorldGen.TileRunner` port.
+- `Mount Caves` and `Dirt Wall Backgrounds`.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-all 1 implemented passes match the reference.
-next to write: "Dunes"
+7/106 recorded passes are implemented, and 6 of those match the reference's draw stream.
 ```
+
+### What the oracle cannot see, and what that costs
+
+The comparison runs every implemented pass rather than stopping at the first disagreement, because
+each pass is reseeded and its `RandNext` is therefore its own proof. That mattered immediately:
+"Dirt Wall Backgrounds" matches while "Mount Caves", the pass before it, does not.
+
+`RandNext` says nothing about tiles, and from pass 6 onward several passes branch on them. Mount
+Caves screens a 100 by 50 box around the first solid tile in its column and refuses to dig if it
+finds sand, so its draw count is a function of the terrain. The reference drew 780 numbers there
+and we drew 384, which decodes cleanly: vanilla dug in all four attempts and we dug in two, and the
+two we lost were rejected by sand sitting where vanilla's own surface was a few rows higher. That
+is a terrain difference reporting itself as an RNG difference.
+
+The reference world cannot settle it, because by then it has had all 106 passes applied to it: the
+same column shows later Crimstone and caves where pass 6 saw untouched ground. So the next piece of
+tooling is vanilla's tile state *entering* pass N, which is finding 1 below: the shipped worldgen
+debugger already hashes the world after every pass, and a stopped-after-N pass loop writes the
+intermediate world directly.
 
 ## What is not
 
-The other 105 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 99 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 
