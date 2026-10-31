@@ -112,6 +112,9 @@ pub struct GenVars {
     pub pyr_x: Vec<i32>,
     pub pyr_y: Vec<i32>,
     pub num_pyr: usize,
+    /// `GenVars.tunnelX`/`numTunnels`: the surface tunnels' centre columns.
+    pub tunnel_x: Vec<i32>,
+    pub num_tunnels: usize,
 }
 
 impl GenVars {
@@ -169,6 +172,8 @@ impl GenVars {
             pyr_x: Vec::new(),
             pyr_y: Vec::new(),
             num_pyr: 0,
+            tunnel_x: vec![0; 50],
+            num_tunnels: 0,
         }
     }
 }
@@ -193,6 +198,18 @@ pub const PASSES: &[Pass] = &[
     Pass {
         name: "Dunes",
         run: super::dunes::run,
+    },
+    Pass {
+        name: "Ocean Sand",
+        run: super::ocean_sand::run,
+    },
+    Pass {
+        name: "Sand Patches",
+        run: super::sand_patches::run,
+    },
+    Pass {
+        name: "Tunnels",
+        run: super::tunnels::run,
     },
 ];
 
