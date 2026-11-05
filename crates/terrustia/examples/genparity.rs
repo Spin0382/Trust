@@ -248,6 +248,70 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
     }
 }
 
+/// Print where one column disagrees, collapsing each run of differing rows to one line.
+///
+/// `--diff` can say a pass put about thirty thousand tiles in the wrong place without saying
+/// where. A single column read side by side does: it turns an aggregate into a shape, which is
+/// what a biome port is actually wrong about.
+fn diff_column(
+    ours: &terrustia::world::World,
+    theirs: &terrustia::world::World,
+    column: i32,
+    label: &str,
+) {
+    let height = ours.height().min(theirs.height());
+    let cell = |world: &terrustia::world::World, row: i32| {
+        let tile = world.tile(column, row);
+        (
+            tile.is_active(),
+            if tile.is_active() { tile.block } else { 0 },
+            tile.wall,
+        )
+    };
+    let surface_of = |world: &terrustia::world::World| -> i32 {
+        (0..height)
+            .find(|row| world.tile(column, *row).is_active())
+            .unwrap_or(height)
+    };
+    println!("column {column} against {label}:");
+    println!(
+        "  surface: ours {}, theirs {}",
+        surface_of(ours),
+        surface_of(theirs)
+    );
+    let mut runs = 0;
+    let mut start: Option<i32> = None;
+    for row in 0..=height {
+        if row < height && cell(ours, row) != cell(theirs, row) {
+            if start.is_none() {
+                start = Some(row);
+            }
+            continue;
+        }
+        let Some(from) = start.take() else { continue };
+        runs += 1;
+        if runs > 40 {
+            continue;
+        }
+        let a = cell(ours, from);
+        let b = cell(theirs, from);
+        println!(
+            "  rows {from}..{}: ours active={} block={} wall={} | theirs active={} block={} \
+             wall={}",
+            row - 1,
+            a.0,
+            a.1,
+            a.2,
+            b.0,
+            b.1,
+            b.2
+        );
+    }
+    if runs > 40 {
+        println!("  ({runs} differing runs in total, first 40 shown)");
+    }
+}
+
 fn main() -> ExitCode {
     let Some(path) = env::args().nth(1) else {
         eprintln!("usage: genparity <reference.wld>");
@@ -363,7 +427,14 @@ fn main() -> ExitCode {
                 }
             };
             match wld::parse(&bytes) {
-                Ok(reference) => diff_worlds(&built, &reference, &other),
+                Ok(reference) => {
+                    diff_worlds(&built, &reference, &other);
+                    if let Some(column) =
+                        arg_after("--column").and_then(|text| text.parse::<i32>().ok())
+                    {
+                        diff_column(&built, &reference, column, &other);
+                    }
+                }
                 Err(e) => eprintln!("could not parse {other}: {e}"),
             }
         }
