@@ -163,9 +163,17 @@ impl Description {
     }
 }
 
-/// `SurfaceMap.FromArea`, restricted to what this module needs. Shares its shape with
-/// `dunes::SurfaceMap`; kept separate because that one is private to its own module and this one
-/// also needs the average and the bottom.
+/// `SurfaceMap.FromArea` (`Terraria.GameContent.Biomes.Desert/SurfaceMap.cs:44-74`) plus the
+/// constructor's clamp (`:22-42`), returning the heights, the average and the bottom.
+///
+/// Two details matter and the earlier version of this function had neither. A cloud tile does not
+/// end the scan, it *reopens* it: vanilla sets the flag back to false on a cloud and then the
+/// following `if (!flag)` immediately pushes the column's height to `maxTilesY / 2 + 50`, so a
+/// column under a cloud reads as open ground until another active tile lands lower. And the
+/// bottom is clamped by `Main.worldSurface - 10` (`:35-37`), which caps how deep a desert can be
+/// sited on a world whose hills dip low. Without that clamp the hive sits below where vanilla
+/// puts it, and the sand the mound lays down then ends up over air, which is how ~30k cells came
+/// out as hardened sand instead of sand in the pass-20 tile diff.
 fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) {
     let half = world.height() / 2;
     let mut heights = Vec::with_capacity(width.max(0) as usize);
@@ -173,12 +181,19 @@ fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) 
     let mut bottom = 0;
     for i in start_x..start_x + width {
         let mut found = false;
-        let mut height = half + 50;
+        let mut height = 0;
         for j in 50..50 + half {
             let t = world.tile(i, j);
-            if t.is_active() && !matches!(t.block, 189 | 196 | 460 | 717 | 718 | 719) && !found {
-                height = j;
-                found = true;
+            if t.is_active() {
+                if is_cloud(t.block) {
+                    found = false;
+                } else if !found {
+                    height = j;
+                    found = true;
+                }
+            }
+            if !found {
+                height = half + 50;
             }
         }
         sum += i64::from(height);
@@ -190,7 +205,18 @@ fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) 
     } else {
         sum as f64 / heights.len() as f64
     };
+    let world_surface = f64::from(world.surface);
+    let bottom = if f64::from(bottom) > world_surface - 10.0 {
+        i32::from(world.surface) - 10
+    } else {
+        bottom
+    };
     (heights, average, bottom)
+}
+
+/// `TileID.Sets.Clouds` (`TileID.cs:197`).
+fn is_cloud(block: u16) -> bool {
+    matches!(block, 189 | 196 | 460 | 717 | 718 | 719)
 }
 
 /// `DesertDescription.CreateFromPlacement` (`:43-84`). `None` where vanilla returns `Invalid`.
