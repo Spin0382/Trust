@@ -417,6 +417,51 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // `--surface <file>:<fromColumn>:<toColumn>:<rowFrom>:<rowTo>` prints, per column, the first
+    // row inside the window that is active. It answers "which columns did this pass actually dig?"
+    // without a per-cell dump: a stepped world before and after one pass, profiled the same way,
+    // differs only where that pass moved the ground, and comparing the two profiles against our
+    // own is what tells a mound edge apart from ordinary terrain.
+    if let Some(spec) = arg_after("--surface") {
+        let nums: Vec<Option<i32>> = spec
+            .split(':')
+            .skip(1)
+            .map(|text| text.parse().ok())
+            .collect();
+        let [Some(from), Some(to), Some(row_from), Some(row_to)] = nums.as_slice() else {
+            eprintln!("--surface wants file:fromCol:toCol:rowFrom:rowTo");
+            return ExitCode::FAILURE;
+        };
+        let file = match spec.split_once(':') {
+            Some(parts) => parts.0,
+            None => {
+                eprintln!("--surface wants file:fromCol:toCol:rowFrom:rowTo");
+                return ExitCode::FAILURE;
+            }
+        };
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("could not read {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let profiled = match wld::parse(&bytes) {
+            Ok(world) => world,
+            Err(e) => {
+                eprintln!("could not parse {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        for column in *from..=*to {
+            let surface = (*row_from..=*row_to)
+                .find(|row| profiled.tile(column, *row).is_active())
+                .unwrap_or(*row_to + 1);
+            println!("col {column} surface {surface}");
+        }
+        return ExitCode::SUCCESS;
+    }
+
     // `--peek <file>:<column>:<from>:<to>` dumps one column of one world and stops. Aggregates can
     // say a pass wrote the wrong cells; only a dump says what is standing there. The desert's
     // whole remaining gap turned on one such question: what tile does the world stopped one pass
