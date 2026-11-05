@@ -267,12 +267,20 @@ pub fn describe(
 }
 
 /// `SandMound.Place` (`:7-50`): scoop the surface out and fill the bowl with sand.
+///
+/// `.NET Rectangle.Bottom` and `.Right` are the last covered cell (`Y + Height - 1`), while this
+/// crate's `Rect::bottom()` and `Rect::right()` are one past it, so every place vanilla reads
+/// `.Bottom` this module has to subtract one. Getting that wrong shifts the whole mound by a row
+/// and changes how many column tiles get framed, which is a draw difference per tile.
 fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
     let mut bowl = d.desert;
     bowl.height = d.desert.height.min(d.hive.height / 2);
-    let mut lower = d.desert;
-    lower.y = bowl.bottom();
-    lower.height = (d.desert.bottom() - bowl.bottom()).max(0);
+    // `.NET Rectangle.Bottom` is the last covered row, so both rectangles are named by their
+    // inclusive bottom here rather than by this crate's exclusive `bottom()`.
+    let bowl_bottom = bowl.y + bowl.height - 1;
+    let original_bottom = d.desert.y + d.desert.height - 1;
+    let lower_span = (original_bottom - bowl_bottom).max(0);
+    let lower_bottom = bowl_bottom + lower_span - 1;
 
     let mut wobble_a = 0;
     let mut wobble_b = 0;
@@ -287,7 +295,7 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
         wobble_b = wobble_b.clamp(-10, 10);
 
         let curve = (1.0 - across * across * across * across).max(0.0).sqrt();
-        let floor = bowl.bottom() - (curve * f64::from(bowl.height)) as i32 + wobble_a;
+        let floor = bowl_bottom - (curve * f64::from(bowl.height)) as i32 + wobble_a;
         if across.abs() < 1.0 {
             // `Utils.UnclampedSmoothStep(0.5, 0.8, |across|)`.
             let t = (across.abs() - 0.5) / 0.3;
@@ -302,8 +310,10 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
                 }
             }
         }
-        // `PlaceSandColumn`.
-        let height = lower.bottom() - floor;
+        // `PlaceSandColumn`: `height = desert2.Bottom - num5` with the inclusive bottom, and the
+        // loop writes `startY + height - 1` down to `startY`, so the top row written is one above
+        // `desert2.Bottom`.
+        let height = lower_bottom - floor;
         for j in (floor..floor + height).rev() {
             if !world.in_bounds(i + d.desert.x, j) {
                 continue;
@@ -1070,10 +1080,11 @@ pub fn place(
     add_tile_variance(world, rand, &d.hive);
     cleanup_area(world, rand, &d.hive);
 
-    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20`, not that minus
-    // the `50` the rectangle starts at. The recorded area is therefore taller than the desert, and
-    // every later `CanPlace` test inside it is refused for rows that have no sand in them.
-    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 20);
+    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20` with the
+    // inclusive `.Bottom`, so one less than this crate's exclusive `bottom()` minus 20. The
+    // recorded area is therefore taller than the desert, and every later `CanPlace` test inside it
+    // is refused for rows that have no sand in them.
+    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 21);
     structures.add_structure(area, 10);
     Some(d)
 }
