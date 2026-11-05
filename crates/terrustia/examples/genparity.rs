@@ -294,6 +294,7 @@ fn diff_column(
             tile.is_active(),
             if tile.is_active() { tile.block } else { 0 },
             tile.wall,
+            if tile.is_active() { tile.liquid } else { 0 },
         )
     };
     let surface_of = |world: &terrustia::world::World| -> i32 {
@@ -324,15 +325,17 @@ fn diff_column(
         let a = cell(ours, from);
         let b = cell(theirs, from);
         println!(
-            "  rows {from}..{}: ours active={} block={} wall={} | theirs active={} block={} \
-             wall={}",
+            "  rows {from}..{}: ours active={} block={} wall={} liquid={} | theirs active={} \
+             block={} wall={} liquid={}",
             row - 1,
             a.0,
             a.1,
             a.2,
+            a.3,
             b.0,
             b.1,
-            b.2
+            b.2,
+            b.3
         );
     }
     if runs > 40 {

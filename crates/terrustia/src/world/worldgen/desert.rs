@@ -125,7 +125,11 @@ impl FastRandom {
 /// with plain sandstone while leaving its old `frame_x`/`frame_y` behind leaves the running world
 /// holding frames that a save drops, because the format only stores them for frame-important
 /// types. That is 17 tiles differing across a save, which is how this was found.
+/// `Tile.ResetToType` (`Tile.cs:250-258`): liquid to nothing, the header back to plain active, no
+/// slope, no paint, frame cleared, then the type. Clearing the liquid is part of it, and the
+/// `.wld` comparison reads the amount, so forgetting it leaves water in cells vanilla drains.
 fn reset_to_type(t: &mut Tile, block: u16) {
+    t.liquid = 0;
     t.block = block;
     t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
     t.slope = 0;
@@ -504,7 +508,7 @@ fn place_clusters(
                 }
             } else if strength > 1.8 {
                 t.wall = HIVE_WALL;
-                if j < layout_surface(d) {
+                if j < i32::from(world.surface) {
                     t.liquid = 0;
                 } else {
                     t.liquid_kind = Liquid::Lava;
@@ -523,7 +527,7 @@ fn place_clusters(
                 let chance = (strength - 0.25) / 0.45;
                 if local.next_double() < chance {
                     t.wall = HIVE_WALL;
-                    if j < layout_surface(d) {
+                    if j < i32::from(world.surface) {
                         t.liquid = 0;
                     } else {
                         t.liquid_kind = Liquid::Lava;
@@ -545,11 +549,6 @@ fn place_clusters(
     let _ = rand;
 }
 
-/// The desert's own top, used where vanilla reads `Main.worldSurface`.
-fn layout_surface(d: &Description) -> i32 {
-    d.desert.y
-}
-
 /// `DesertHive.AddTileVariance` (`:390-478`), minus the decorative placements that need objects
 /// this generator does not site underground.
 fn tile_variance(world: &mut World, d: &Description) {
@@ -565,8 +564,10 @@ fn tile_variance(world: &mut World, d: &Description) {
             let solid_below = below.is_active() && tile_solid::solid(below.block);
             let solid_below2 = below2.is_active() && tile_solid::solid(below2.block);
             if t.block == SAND && t.is_active() && (!solid_below || !solid_below2) {
+                // `DesertHive.cs:433-436` assigns `tile.type = 397` directly. It is not a
+                // `ResetToType`, so the liquid, the slope and the frames all stay as they were.
                 let mut t = t;
-                reset_to_type(&mut t, HARDENED_SAND);
+                t.block = HARDENED_SAND;
                 world.set_tile(x, y, t);
             }
         }
@@ -1152,6 +1153,60 @@ fn is_boulder(block: u16) -> bool {
     )
 }
 
+/// `WorldGen.PlaceTight` (`WorldGen.cs:38704-38725`) plus the one arm of
+/// `PlaceUncheckedStalactite` (`:38727+`) that this call site can reach. Returns the draws taken.
+///
+/// `PlaceTight` first refuses a shimmering cell or a live 231, and only then evaluates its
+/// arguments - so the two draws happen inside that guard, not before it (`:38719-38723`). Inside,
+/// nothing is written unless the cell above is solid and both the target and the cell under it are
+/// empty (`:38732`).
+///
+/// From `AddTileVariance` the target is either the cell *above* a sandstone - and that branch only
+/// runs when `flag` says three rows above are clear, so the cell the stalactite would hang from is
+/// air and nothing can be written - or the cell *below* it, whose above-neighbour is the sandstone
+/// itself. So of the six support arms in the source only `type == 396 || type == 397`
+/// (`:38820-38845`) is reachable here, with frameX `378 + variation * 18`: one cell at frameY 72
+/// when the small variant is rolled, two cells at 0 and 18 otherwise. The other arms belong to
+/// materials this loop never stands on, and are absent deliberately rather than guessed at.
+fn place_tight(world: &mut World, rand: &mut UnifiedRandom, column: i32, row: i32) -> usize {
+    let target = world.tile(column, row);
+    if target.is_active() && target.block == 231 {
+        return 0;
+    }
+    let prefer_small = rand.next_max(2) == 0;
+    let variation = rand.next_max(3);
+    let above = world.tile(column, row - 1);
+    let hangs_from_solid_ground = above.is_active()
+        && tile_solid::solid(above.block)
+        && above.slope == 0
+        && !tile_solid::solid_top(above.block);
+    if !hangs_from_solid_ground || target.is_active() || world.tile(column, row + 1).is_active() {
+        return 2;
+    }
+    if above.block != SANDSTONE && above.block != HARDENED_SAND {
+        return 2;
+    }
+    let base = (378 + variation * 18) as i16;
+    let mut head = target;
+    head.block = STALACTITE;
+    head.flags = TileFlags(head.flags.0 | TileFlags::ACTIVE);
+    head.frame_x = base;
+    head.frame_y = if prefer_small { 72 } else { 0 };
+    world.set_tile(column, row, head);
+    if !prefer_small {
+        let mut foot = world.tile(column, row + 1);
+        foot.block = STALACTITE;
+        foot.flags = TileFlags(foot.flags.0 | TileFlags::ACTIVE);
+        foot.frame_x = base;
+        foot.frame_y = 18;
+        world.set_tile(column, row + 1, foot);
+    }
+    2
+}
+
+/// The tile `PlaceUncheckedStalactite` writes: `ushort type = 165` (`WorldGen.cs:38729`).
+const STALACTITE: u16 = 165;
+
 /// `DesertHive.AddTileVariance` (`DesertHive.cs:420-506`), the second loop.
 ///
 /// Sandstone that has air above it (`clear_above`) or below it (`clear_below`) rolls for a
@@ -1233,12 +1288,7 @@ fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
                 place_2x2(world, column, row - 1, 484, 0);
             } else if (clear_above ^ clear_below) && rand.next_max(5) == 0 {
                 let target = if clear_above { row - 1 } else { row + 1 };
-                // `PlaceTight`: the guard at `WorldGen.cs:38719` is a shimmer and a 231 test, and
-                // neither can hold of a cell the scan above just found empty, so both draws happen.
-                if !world.tile(column, target).is_active() {
-                    let _ = rand.next_max(2);
-                    let _ = rand.next_max(3);
-                }
+                let _ = place_tight(world, rand, column, target);
             } else if clear_above && rand.next_max(5) == 0 {
                 let style = 29 + rand.next_max(6);
                 place_3x2(world, column, row - 1, 187, style);
@@ -1383,6 +1433,29 @@ mod tests {
         let mut c = FastRandom::new(1234).with_xy(7, 9);
         let mut d = FastRandom::new(1234).with_xy(7, 9);
         assert_eq!(c.next(1000), d.next(1000));
+    }
+
+    /// `AddTileVariance`'s third branch hangs a stalactite under the sandstone it is standing on,
+    /// and on the reference world that is 1,570 cells. A desert that writes none of them is missing
+    /// a material the later passes and the save file both see.
+    #[test]
+    fn the_hive_hangs_stalactites_under_its_sandstone() {
+        let mut world = sandy(1600, 900);
+        let layout = layout_for(&world);
+        let mut structures = StructureMap::new();
+        let mut rand = UnifiedRandom::new(31415);
+        scatter(&mut world, &layout, &mut structures, &mut rand, 999)
+            .expect("the desert was refused");
+        let mut spikes = 0;
+        for x in 300..900 {
+            for y in 120..700 {
+                let t = world.tile(x, y);
+                if t.is_active() && t.block == STALACTITE {
+                    spikes += 1;
+                }
+            }
+        }
+        assert!(spikes > 100, "the desert hung no stalactites: {spikes}");
     }
 
     /// The field's sand-versus-hardened-sand speckle is one `FastRandom` advanced once per cell
