@@ -103,9 +103,10 @@ impl FastRandom {
     }
 
     pub fn next(&mut self, max: i32) -> i32 {
-        if max <= 0 {
-            return 0;
-        }
+        debug_assert!(max >= 0, "the game throws on a negative maximum");
+        // `FastRandom.cs:65` tests the power-of-two case with `(max & -max) == max`, which is true
+        // for zero, and the branch then multiplies by `NextBits(31)`: a `Next(0)` consumes a draw
+        // and returns 0. Returning early for zero would desync the stream from vanilla's.
         if (max & max.wrapping_neg()) == max {
             return ((i64::from(max) * i64::from(self.next_bits(31))) >> 31) as i32;
         }
