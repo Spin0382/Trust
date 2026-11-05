@@ -78,18 +78,27 @@ Two further properties worth knowing:
   the pass still has to occupy its manifest slot.
 - `Generate Ice Biome`, whose `snowMinX`/`snowMaxX` walk the later ice passes read back, and
   `Grass`, which converts a dirt pocket only when all four of its neighbours are dirt.
+- `Mud Caves To Grass`, which draws nothing on an ordinary seed: it spreads jungle grass
+  recursively through mud (capped at 1000 nested calls) and removes connected solid clumps
+  shorter than 20 tiles. The stepped world check for pass 19 is clean in every tile.
+- `Jungle`, the largest pass in the manifest: three mud blobs with their gem pockets, the
+  10,000-step mud runner, the `KillTile` worm up to the surface, the 1,050 mud-wall holes, and the
+  finishing-touches loops. It needed three pieces of `TileRunner` the earlier passes never reached
+  (`GenVars.mudWall` and its walls 15/64, the type-59 stop at the top of the world, and the type-59
+  vertical steering), plus `WorldGen.KillTile` and `PlaceWall`.
 
 Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-17/106 recorded passes are implemented, and 17 of those match the reference's draw stream.
+19/106 recorded passes are implemented, and 19 of those match the reference's draw stream.
 every implemented pass matches.
-next to write: "Jungle"
+next to write: "Full Desert"
 ```
 
-and the tile check below says our world is **identical to vanilla's after each of passes 1 to 12**,
-in every field a `.wld` can carry.
+and the tile check below says our world is **identical to vanilla's after each pass it has a step
+file for**, in every field a `.wld` can carry: passes 1 to 14 and 16 to 19. There is no step 15,
+because `Wavy Caves` draws nothing and changes nothing, so its world would be step 14's again.
 
 ### Two oracles, because one is not enough
 
@@ -129,6 +138,24 @@ did, on the surface row, the dirt-to-stone row, the active-tile count per type a
 differing coordinates. `every_stepped_reference_world_is_reproduced_tile_for_tile` is the same
 check as a test: it walks the registry once and asserts total equality with every step file it has.
 
+The draw-stream half is committed, so a hosted runner can check it without an install.
+`crates/terrustia/src/world/worldgen/reference-manifest.json` is the reference world's header
+manifest verbatim: 106 entries, 9.5 KB, each one a pass name, the generator's value immediately
+after that pass, whether it was skipped, and how long the run took.
+`the_registered_passes_match_the_reference_draw_stream` reads it and asserts the whole registry
+against it, which is the same comparison the `genparity` example prints - a gate now rather than a
+verdict written down by hand each time. What still needs a local install is the tile half: the step
+files are ordinary 1.5 MB world saves of a world only the real generator can make, so that test
+skips in CI and runs here.
+
+A third mode of the same patch answers a different question: `WGpatch <in> <out> trace` rewrites
+`WorldGen.TileRunner` to print its nine arguments, and the position the walk finished on, every time
+it is called. That is ground truth for the *shape* of a pass rather than its total, and it is what
+localised the Jungle divergence: the first blob matched exactly, the second did not, so the fault
+was inside the first blob's runner and not in the pass's orchestration. Comparing the argument list
+the reference used against the one the port uses is a one-line diff of two files, and it is worth
+reaching for before reasoning about per-tile branch order.
+
 Two of the three bugs it found are invisible to any amount of RNG checking, because neither changes
 a single draw:
 
@@ -148,8 +175,23 @@ count rather than `i < (int)num`. `5,040,000 * 0.00015` evaluates to 755.9999999
 runs 756 times and a truncating cast runs 755. The missing band-1 runner was the whole difference,
 and it is why the loop in that pass keeps its bound as an `f64`.
 
-With those three fixed, every registered pass matches the reference draw stream, and the tile check
-is clean through pass 8. One caveat belongs with it: the comparison covers only what the file format
+Two more were found by the Jungle pass, and they are the reason it is worth writing down that
+**`Framing.WallFrame` draws from `genRand`**:
+
+- **`WorldGen.PlaceWall` ends with `SquareWallFrame`, which re-rolls the wall's frame number from
+  `genRand.Next(0, 3)`** (`WorldGen.cs:75751`, `Framing.cs:396-402`). `SquareWallFrame` passes its
+  `resetFrame` only to the centre cell, so each *successful* wall placement costs exactly one draw
+  (two for wall 21). The Jungle pass places hundreds of thousands of walls, so the port was 5.17
+  million draws short and every tile after the first wall was wrong. The same applies to
+  `SquareTileFrame`, whose block framing rolls `frameNumber` the same way, which no pass has needed
+  yet.
+- **`MudWallRunner` tests `Main.worldSurface`, while `GenerateHolesInMudWalls` picks its search box
+  from `GenVars.worldSurface`** (`WorldGen.cs:78172` against `JunglePass.cs:205`). The two differ by
+  64 rows here. Feeding the wrong one to the runner erased the surface dirt wall across the whole
+  jungle - 312 tiles, no draw changed.
+
+With those fixed, every registered pass matches the reference draw stream, and the tile check
+is clean through pass 18. One caveat belongs with it: the comparison covers only what the file format
 can express. A `TileRunner` with `addTile` false writes its type onto inactive tiles too and the game
 keeps that in memory, but a `.wld` has no room for a block under an inactive tile, so a loaded
 reference reads 0 there and the test ignores that half rather than failing on a difference the
@@ -157,7 +199,7 @@ shipped server could not send either.
 
 ## What is not
 
-The other 89 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 87 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 

@@ -130,6 +130,36 @@ fn bool_field(text: &str, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The reference world's manifest, copied out of its header verbatim.
+///
+/// Committing it costs 9.5 KB and buys the one thing a hosted runner cannot otherwise get: the
+/// draw stream of a real 1.4.5.8 world. The world file itself cannot be committed, and this is
+/// not game source, an asset or game text. It is the record one ordinary generated world left
+/// behind, 4200 by 1200, crimson, from the seed text `12345`: each pass's name, the generator's
+/// value right after it, whether it was skipped, and how long it took in that run.
+#[cfg(test)]
+pub(crate) const REFERENCE_TEXT: &str = include_str!("reference-manifest.json");
+
+/// The seed the reference world was generated from, as the number the game derives from that text.
+#[cfg(test)]
+pub(crate) const REFERENCE_SEED: i32 = 12_345;
+
+/// The typed seed text behind [`REFERENCE_SEED`]. No registered pass reads it, but the secret-seed
+/// detection in the shipping generator does, so the fixture records it rather than leaving it blank.
+#[cfg(test)]
+pub(crate) const REFERENCE_SEED_TEXT: &str = "12345";
+
+/// Width, height and evil of the world [`REFERENCE_TEXT`] describes.
+#[cfg(test)]
+pub(crate) const REFERENCE_SHAPE: (i32, i32, bool) = (4200, 1200, true);
+
+/// The reference manifest, or panic: it is in the crate, so a failure here is a bug in the reader
+/// rather than a missing local install.
+#[cfg(test)]
+pub(crate) fn reference_manifest() -> Manifest {
+    Manifest::parse(REFERENCE_TEXT).expect("the committed reference manifest should parse")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

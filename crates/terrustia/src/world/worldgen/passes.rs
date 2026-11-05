@@ -71,6 +71,10 @@ pub struct GenVars {
     pub dungeon_location: i32,
     /// The jungle's centre column (`GenVars.jungleOriginX`).
     pub jungle_origin_x: i32,
+    /// `GenVars.JungleX`: the column the Jungle pass's tunnel-to-surface ended on. Later jungle
+    /// passes read it back, so it has to survive the pass even though nothing in Jungle itself
+    /// depends on it (`JunglePass.cs:169`).
+    pub jungle_x: i32,
     /// The snow biome's bounds (`GenVars.snowOriginLeft`/`Right`).
     pub snow_origin_left: i32,
     pub snow_origin_right: i32,
@@ -150,6 +154,7 @@ impl GenVars {
             dungeon_side: DungeonSide::Left,
             dungeon_location: 0,
             jungle_origin_x: 0,
+            jungle_x: 0,
             snow_origin_left: 0,
             snow_origin_right: 0,
             left_beach_end: 0,
@@ -278,6 +283,14 @@ pub const PASSES: &[Pass] = &[
     Pass {
         name: "Grass",
         run: super::grass::run,
+    },
+    Pass {
+        name: "Jungle",
+        run: super::jungle::run,
+    },
+    Pass {
+        name: "Mud Caves To Grass",
+        run: super::mud_caves_to_grass::run,
     },
 ];
 
@@ -593,6 +606,53 @@ mod tests {
         assert_eq!(outcome.checked, 0);
         assert_eq!(outcome.divergences.len(), 1);
         assert!(outcome.divergences[0].name.contains("we have"),);
+    }
+
+    /// Every registered pass, against the reference world's draw stream.
+    ///
+    /// This is the parity gate that needs no local install: the manifest is committed, and
+    /// `compare_against` takes only the reference world's width, height and evil from its file.
+    /// Each pass is reseeded and fingerprinted on its own, so a failure names the pass rather than
+    /// the first place the streams parted.
+    ///
+    /// It says the passes asked for the right numbers in the right order over the world our own
+    /// passes built. That the tiles are vanilla's tiles is the stepped check's job, two tests
+    /// down; a pass that reads the terrain can match a draw stream and still be looking at the
+    /// wrong ground, which is exactly how the `Main.worldSurface` bug survived this test alone.
+    #[test]
+    fn the_registered_passes_match_the_reference_draw_stream() {
+        let manifest = super::super::manifest::reference_manifest();
+        let (width, height, crimson) = super::super::manifest::REFERENCE_SHAPE;
+        let mut reference = World::empty(width, height, "reference");
+        reference.crimson = crimson;
+        reference.seed_text = super::super::manifest::REFERENCE_SEED_TEXT.to_string();
+        let outcome = compare_against(
+            &manifest,
+            super::super::manifest::REFERENCE_SEED,
+            &reference,
+        );
+        assert_eq!(
+            outcome.checked,
+            PASSES.len(),
+            "the registry has {} passes but only {} were compared against the reference",
+            PASSES.len(),
+            outcome.checked
+        );
+        assert!(
+            outcome.divergences.is_empty(),
+            "{}/{} registered passes match the reference draw stream; the rest diverge: {}",
+            outcome.matches,
+            outcome.checked,
+            outcome
+                .divergences
+                .iter()
+                .map(|d| format!(
+                    "{} #{}: expected {}, got {}",
+                    d.name, d.index, d.expected, d.got
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
 
     /// The stepped reference worlds, found the same way `dunes` finds its reference: by walking
