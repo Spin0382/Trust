@@ -128,6 +128,44 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
     };
     let counts_ours = histogram(ours);
     let counts_theirs = histogram(theirs);
+    // Walls counted the same way. Two of the desert's largest draw terms are nothing but wall
+    // framing, so a pass that walls the wrong cells shows up here long before any block count
+    // moves, and a wall total is what `SquareWallFrame` actually charges the stream for.
+    let wall_histogram = |world: &terrustia::world::World| {
+        let mut counts: HashMap<u16, u64> = HashMap::new();
+        for column in 0..width {
+            for row in 0..height {
+                let wall = world.tile(column, row).wall;
+                if wall != 0 {
+                    *counts.entry(wall).or_default() += 1;
+                }
+            }
+        }
+        counts
+    };
+    let walls_ours = wall_histogram(ours);
+    let walls_theirs = wall_histogram(theirs);
+    let mut wall_ids: Vec<u16> = walls_ours
+        .keys()
+        .chain(walls_theirs.keys())
+        .copied()
+        .collect();
+    wall_ids.sort_unstable();
+    wall_ids.dedup();
+    let mut wall_rows: Vec<(i64, u16, u64, u64)> = wall_ids
+        .iter()
+        .map(|w| {
+            let a = walls_ours.get(w).copied().unwrap_or(0);
+            let b = walls_theirs.get(w).copied().unwrap_or(0);
+            (
+                i64::try_from(a).unwrap_or(0) - i64::try_from(b).unwrap_or(0),
+                *w,
+                a,
+                b,
+            )
+        })
+        .collect();
+    wall_rows.sort_by_key(|row| std::cmp::Reverse(row.0.abs()));
     // Where dirt turns to stone, column by column. `TerrainPass.FillColumn` is driven by a
     // per-column rock layer, so a depth error there moves a boundary rather than the surface, and
     // it reads as "more stone, less dirt" in the tile mix long before it looks like a bad surface.
@@ -241,6 +279,10 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
             box_of(ours),
             box_of(theirs)
         );
+    }
+    println!("  walls by type (ours, theirs, largest gap first):");
+    for (delta, w, a, b) in wall_rows.iter().take(8) {
+        println!("    wall {w:>3}  ours {a:>8}  theirs {b:>8}  {delta:+}");
     }
     println!("  active tiles by type (ours, theirs, largest gap first):");
     for (delta, t, a, b) in rows.iter().take(12) {
