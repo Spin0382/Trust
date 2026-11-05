@@ -4,12 +4,14 @@
 //! passes, in the order they ran, and the state of the world's random generator immediately
 //! afterwards. The game writes it as a diagnostic. For a port it is something better — an oracle.
 //!
-//! Because the generator is never reseeded during generation, the value recorded after pass N is
-//! a fingerprint of every draw made by passes one to N. Implement pass N, generate with the same
-//! seed, and compare: if it matches, the RNG consumption of the whole prefix is exactly right,
-//! and if it does not, the first pass that disagrees is the one that is wrong. That turns a
-//! hundred-and-six-link chain, where nothing can be judged until all of it is done, into
-//! something that can be checked one pass at a time.
+//! The game reseeds the generator from the world seed at the start of every pass
+//! (`WorldGenerator.cs:499`) and samples it after the pass (`WorldGenerator.cs:515`), so the value
+//! recorded after pass N fingerprints the draws of pass N itself. Implement pass N, generate from
+//! the same seed, and compare: if it matches, that pass's draw count and order are exactly right,
+//! and if it does not, the value names how far off it is. The first value of a pass that draws
+//! nothing is the seed's own first draw, which is how a reseeded pass is recognisable in a
+//! manifest (the reference world's "Wavy Caves" and "Mud Caves To Grass" both record
+//! `143337951`, the first draw for seed 12345).
 //!
 //! A pass the game was told to skip records no state at all, which is what makes deferring one
 //! free rather than fatal: a stub that draws nothing matches a reference generated with that pass
@@ -126,6 +128,36 @@ fn bool_field(text: &str, key: &str) -> bool {
     text.find(&format!("\"{key}\":"))
         .map(|at| text[at + key.len() + 3..].trim_start().starts_with("true"))
         .unwrap_or(false)
+}
+
+/// The reference world's manifest, copied out of its header verbatim.
+///
+/// Committing it costs 9.5 KB and buys the one thing a hosted runner cannot otherwise get: the
+/// draw stream of a real 1.4.5.8 world. The world file itself cannot be committed, and this is
+/// not game source, an asset or game text. It is the record one ordinary generated world left
+/// behind, 4200 by 1200, crimson, from the seed text `12345`: each pass's name, the generator's
+/// value right after it, whether it was skipped, and how long it took in that run.
+#[cfg(test)]
+pub(crate) const REFERENCE_TEXT: &str = include_str!("reference-manifest.json");
+
+/// The seed the reference world was generated from, as the number the game derives from that text.
+#[cfg(test)]
+pub(crate) const REFERENCE_SEED: i32 = 12_345;
+
+/// The typed seed text behind [`REFERENCE_SEED`]. No registered pass reads it, but the secret-seed
+/// detection in the shipping generator does, so the fixture records it rather than leaving it blank.
+#[cfg(test)]
+pub(crate) const REFERENCE_SEED_TEXT: &str = "12345";
+
+/// Width, height and evil of the world [`REFERENCE_TEXT`] describes.
+#[cfg(test)]
+pub(crate) const REFERENCE_SHAPE: (i32, i32, bool) = (4200, 1200, true);
+
+/// The reference manifest, or panic: it is in the crate, so a failure here is a bug in the reader
+/// rather than a missing local install.
+#[cfg(test)]
+pub(crate) fn reference_manifest() -> Manifest {
+    Manifest::parse(REFERENCE_TEXT).expect("the committed reference manifest should parse")
 }
 
 #[cfg(test)]

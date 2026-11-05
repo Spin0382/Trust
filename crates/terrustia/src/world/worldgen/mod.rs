@@ -32,9 +32,14 @@
 //! points that actually check seed text against it; [`build`]/[`generate`] never do.
 
 pub mod cave_flood;
+pub mod caverer;
 pub mod celebration;
+pub mod clay;
 pub mod dead_mans_chest;
 pub mod desert;
+pub mod dirt_in_rocks;
+pub mod dirt_layer_caves;
+pub mod dirt_wall_backgrounds;
 pub mod dirt_wall_cleanup;
 pub mod dont_starve;
 pub mod dunes;
@@ -44,7 +49,10 @@ pub mod floating_islands;
 pub mod for_the_worthy;
 pub mod gem_caves;
 pub mod genpipe;
+pub mod grass;
 pub mod hive;
+pub mod ice_biome;
+pub mod jungle;
 pub mod jungle_shrines;
 pub mod lakes;
 pub mod layout;
@@ -55,35 +63,48 @@ pub mod manifest;
 pub mod micro_biomes;
 pub mod mining_explosives;
 pub mod moss;
+pub mod mount_caves;
+pub mod mud_caves_to_grass;
 pub mod not_the_bees;
 pub mod oasis;
+pub mod ocean_sand;
 pub mod passes;
 pub mod piles;
 pub mod place_object;
 pub mod pots;
 pub mod pyramids;
 pub mod rand;
+pub mod reset;
+pub mod rock_layer_caves;
+pub mod rocks_in_dirt;
+pub mod sand_patches;
 pub mod scenery;
 pub mod secret_seed;
 pub mod shape_data;
 pub mod skyblock;
+pub mod small_holes;
 pub mod smooth;
 pub mod speleothems;
 pub mod spider_caves;
 pub mod statue_gen;
 pub mod structure_map;
 pub mod structures;
+pub mod surface_caves;
 pub mod surface_plants;
 pub mod terrain;
+pub mod terrain_pass;
 pub mod thin_ice;
 pub mod tile_cleanup;
+pub mod tile_runner;
 pub mod tiles;
 pub mod traps;
+pub mod tunnels;
 pub mod underground_cabins;
 pub mod underworld_ruins;
 pub mod wall_variety;
 pub mod water_plants;
 pub mod waterfalls;
+pub mod wavy_caves;
 
 pub use passes::compare_against;
 
@@ -471,7 +492,7 @@ pub fn build_with_secret_seed(
     let heights = terrain::heightmap(&plan, &mut rand);
     terrain::fill(&mut world, &plan, &heights, &mut rand);
 
-    structures::caves(&mut world, &plan, &mut rand);
+    structures::caves(&mut world, &plan, &heights, &mut rand);
     structures::ores(&mut world, &plan, &mut rand);
 
     // `GravitatingSandCleanup` (pass 36) then `DirtWallCleanup` (39) — both run here in vanilla's
@@ -737,8 +758,8 @@ pub fn build_with_secret_seed(
     // difference either way — this project already discloses seeds not being map-identical to real
     // Terraria), at the cost of invalidating this row's own already-measured, already-published
     // counts for no behavioural gain.
-    let cave_wall_variety = wall_variety::variety(&mut world, &plan, &mut rand);
-    let cave_walls_enclosed = wall_variety::enclosed_spaces(&mut world, &plan, &mut rand);
+    let cave_wall_variety = wall_variety::variety(&mut world, &plan, &heights, &mut rand);
+    let cave_walls_enclosed = wall_variety::enclosed_spaces(&mut world, &plan, &heights, &mut rand);
     let moss_changed = moss::scatter(&mut world, &plan, &mut rand);
     let long_moss = moss::hang_long_moss(&mut world);
     // `QuickCleanup` (70), then `SurfaceOreAndStone` (74), then `SurfaceDirtWallsToGrassWalls`
@@ -1845,12 +1866,26 @@ mod tests {
     /// worldgen passes drain liquid without resetting the type byte, matching vanilla's own
     /// `Tile.liquidType`, which is not reset on drain either); that byte alone differing, with
     /// both sides genuinely dry, is not a real difference a save lost.
+    /// A second, same-shaped exemption: `frameX`/`frameY` on a tile type that is not frame
+    /// important. The format only carries frames for framed types, in this writer and in vanilla's
+    /// own (`section.rs` gates both directions on `tile_sets::frame_important`), and marble is one
+    /// of the many ids that is not framed: `Main.cs` gives 367 `tileSolid`, `tileBlockLight`,
+    /// `tileMergeDirt` and `npcCatchable` and never sets `tileFrameImportant` for it, among the 405
+    /// ids that do. Several generator paths stamp frames onto such tiles because they build the
+    /// tile as a 2x2 or 3x2 unit; the in-memory world keeps them, exactly as vanilla's does, and
+    /// the file has nowhere to put them. That is a format limit, not a save losing something.
     fn tiles_equal_for_save(before: Tile, after: Tile) -> bool {
         before == after
             || (before.liquid == 0
                 && after.liquid == 0
                 && Tile {
                     liquid_kind: after.liquid_kind,
+                    ..before
+                } == after)
+            || (!terrustia_proto::tile_sets::frame_important(before.block)
+                && Tile {
+                    frame_x: after.frame_x,
+                    frame_y: after.frame_y,
                     ..before
                 } == after)
     }

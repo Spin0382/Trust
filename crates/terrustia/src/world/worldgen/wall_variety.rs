@@ -41,6 +41,14 @@
 //! `maxTileCount`/`maxWallOut2` already cap them — this project just leans on that existing cap
 //! rather than needing a new one, unlike `gem_caves.rs`/`spider_caves.rs` which had to add one.
 //!
+//! **None of the three floods enters the sky.** A site on the surface tile of a low column used to
+//! flood all the open air above it, because the completion gate above is dropped; the mud painter
+//! could do the same from any cave that opened upward. The result was thousands of cave-wall and
+//! mud-wall tiles hanging above the ground. A tile above the column's own heightmap entry is now a
+//! boundary in all three floods, so a pocket that opens to the sky paints only the part inside the
+//! ground. Vanilla does not need this because its flood hits the 1000-tile cap on the sky and the
+//! site is rejected.
+//!
 //! **`GenVars.lavaLine` has no dedicated field in this project's `Layout`** — every depth check
 //! against it below reads `layout.underworld` instead, the same stand-in `terrain.rs`/`structures.rs`
 //! already established for "the lava/underworld threshold" (see e.g. `terrain.rs`'s own underworld
@@ -101,7 +109,13 @@ fn touches_invalid(world: &World, x: i32, y: i32) -> bool {
 /// [`INVALID_NEIGHBOURS`] along the way. Returns the visited set, whether the fill completed inside
 /// the 1000-tile budget (`false` once the cap is hit, matching vanilla's own `ShapeFloodFill.Perform`
 /// return value), and whether any visited tile touched an invalid neighbour.
-fn flood_open(world: &World, x: i32, y: i32, max_tiles: usize) -> (ShapeData, bool, bool) {
+fn flood_open(
+    world: &World,
+    heights: &[i32],
+    x: i32,
+    y: i32,
+    max_tiles: usize,
+) -> (ShapeData, bool, bool) {
     let mut shape = ShapeData::new();
     let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::from([(x, y)]);
@@ -117,6 +131,17 @@ fn flood_open(world: &World, x: i32, y: i32, max_tiles: usize) -> (ShapeData, bo
             break;
         }
         if !world.in_bounds(cx, cy) {
+            continue;
+        }
+        // The sky is not a cave pocket. Without this, a site on the surface tile of a low column
+        // floods the open air above it and walls a patch of sky, which is where the "underground
+        // walls on the surface" came from. Vanilla never sees this: its flood hits the 1000-tile
+        // cap on something that large and the site is rejected, but this generator dropped that
+        // completion gate (see below) because its cave network is one big interconnected space.
+        if heights
+            .get(cx as usize)
+            .is_some_and(|&surface| cy < surface)
+        {
             continue;
         }
         let here = world.tile(cx, cy);
@@ -171,7 +196,12 @@ fn paint_outer_outline(world: &mut World, shape: &ShapeData, wall: u16) {
 }
 
 /// The `CaveWallVariety` pass. Returns how many pockets were painted.
-pub fn variety(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) -> usize {
+pub fn variety(
+    world: &mut World,
+    layout: &Layout,
+    heights: &[i32],
+    rand: &mut UnifiedRandom,
+) -> usize {
     if layout.width < 40 || layout.height < 400 {
         // `RandomWorldPoint((int)worldSurface, 2, 190, 2)` needs `worldSurface..height-190` to be
         // non-empty and `2..width-2` likewise — a guard against the same `next_range` panic class
@@ -245,7 +275,7 @@ pub fn variety(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) -> 
         // call. Dropped for the same reason `gem_caves.rs` dropped its own `found.tiles >= 300`
         // rejection: the cap still bounds the *paint* footprint (`flood_open`'s own `max_tiles`),
         // it just no longer gates *acceptance* too.
-        let (shape, _completed, touched_invalid) = flood_open(world, x, y - 1, 1000);
+        let (shape, _completed, touched_invalid) = flood_open(world, heights, x, y - 1, 1000);
         if shape.count() > 50 && !touched_invalid {
             paint_outer_outline(world, &shape, wall);
             painted += 1;
@@ -261,7 +291,7 @@ pub fn variety(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) -> 
 /// boundary tile gets the wall too but does not extend the flood past it. No cap of its own in
 /// vanilla — bounded here at `max_tiles`, matching every other flood this session capped for the
 /// same reason (see the module doc).
-fn spread_wall(world: &mut World, x: i32, y: i32, wall: u16, max_tiles: usize) {
+fn spread_wall(world: &mut World, heights: &[i32], x: i32, y: i32, wall: u16, max_tiles: usize) {
     let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::from([(x, y)]);
     while let Some((cx, cy)) = queue.pop_front() {
@@ -269,6 +299,12 @@ fn spread_wall(world: &mut World, x: i32, y: i32, wall: u16, max_tiles: usize) {
             continue;
         }
         if !world.in_bounds(cx, cy) {
+            continue;
+        }
+        if heights
+            .get(cx as usize)
+            .is_some_and(|&surface| cy < surface)
+        {
             continue;
         }
         let mut t = world.tile(cx, cy);
@@ -294,7 +330,7 @@ fn spread_wall(world: &mut World, x: i32, y: i32, wall: u16, max_tiles: usize) {
 const CANNOT_BE_REPLACED: [u16; 7] = [4, 40, 3, 83, 87, 244, 34];
 const MAX_WALL_OUT: usize = 5000;
 
-fn spread_wall_mud(world: &mut World, x: i32, y: i32) {
+fn spread_wall_mud(world: &mut World, heights: &[i32], x: i32, y: i32) {
     const MUD: u16 = walls::MUD;
     let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::from([(x, y)]);
@@ -304,6 +340,12 @@ fn spread_wall_mud(world: &mut World, x: i32, y: i32) {
             continue;
         }
         if !world.in_bounds(cx, cy) {
+            continue;
+        }
+        if heights
+            .get(cx as usize)
+            .is_some_and(|&surface| cy < surface)
+        {
             continue;
         }
         let mut t = world.tile(cx, cy);
@@ -355,7 +397,12 @@ fn wall_for_pocket(found: &cave_flood::CaveCount, rand: &mut UnifiedRandom) -> u
 
 /// The `CaveWallsInEnclosedSpaces` pass. Returns how many pockets were painted (both loops
 /// combined).
-pub fn enclosed_spaces(world: &mut World, layout: &Layout, rand: &mut UnifiedRandom) -> usize {
+pub fn enclosed_spaces(
+    world: &mut World,
+    layout: &Layout,
+    heights: &[i32],
+    rand: &mut UnifiedRandom,
+) -> usize {
     if layout.width < 400 || layout.height < 450 {
         // Same guard shape as `variety` above — this pass's own site search needs
         // `(worldSurface+rock)/2 .. height-220` to be non-empty.
@@ -390,7 +437,7 @@ pub fn enclosed_spaces(world: &mut World, layout: &Layout, rand: &mut UnifiedRan
         }
         if tries < 500 {
             let wall = wall_for_pocket(&found, rand);
-            spread_wall(world, x, y, wall, 1500);
+            spread_wall(world, heights, x, y, wall, 1500);
             painted += 1;
         }
     }
@@ -418,7 +465,7 @@ pub fn enclosed_spaces(world: &mut World, layout: &Layout, rand: &mut UnifiedRan
             };
         }
         if tries < 1000 {
-            spread_wall_mud(world, x, y);
+            spread_wall_mud(world, heights, x, y);
             painted += 1;
         }
     }
@@ -465,7 +512,8 @@ mod tests {
         }
 
         let mut rand = UnifiedRandom::new(5);
-        let painted = variety(&mut world, &layout, &mut rand);
+        let heights = vec![layout.surface - 1; layout.width as usize];
+        let painted = variety(&mut world, &layout, &heights, &mut rand);
         assert!(painted > 0, "expected at least one painted pocket");
 
         let has_variety_wall = (0..world.width())
@@ -493,7 +541,8 @@ mod tests {
             }
         }
         let mut rand = UnifiedRandom::new(9);
-        let painted = enclosed_spaces(&mut world, &layout, &mut rand);
+        let heights = vec![layout.surface; layout.width as usize];
+        let painted = enclosed_spaces(&mut world, &layout, &heights, &mut rand);
         assert!(painted > 0, "expected at least one enclosed pocket filled");
         let walled = (cx - 6..cx + 6)
             .flat_map(|x| (cy - 6..cy + 6).map(move |y| (x, y)))
@@ -506,7 +555,8 @@ mod tests {
     fn a_small_world_does_not_panic() {
         let (mut world, layout) = stone_world(400, 300, 1);
         let mut rand = UnifiedRandom::new(1);
-        assert_eq!(variety(&mut world, &layout, &mut rand), 0);
-        assert_eq!(enclosed_spaces(&mut world, &layout, &mut rand), 0);
+        let heights = vec![layout.surface; layout.width as usize];
+        assert_eq!(variety(&mut world, &layout, &heights, &mut rand), 0);
+        assert_eq!(enclosed_spaces(&mut world, &layout, &heights, &mut rand), 0);
     }
 }

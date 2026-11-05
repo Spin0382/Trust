@@ -923,7 +923,7 @@ mod tests {
         let layout = Layout::plan(4200, 1200, &mut rand);
         let heights = super::super::terrain::heightmap(&layout, &mut rand);
         super::super::terrain::fill(&mut world, &layout, &heights, &mut rand);
-        super::super::structures::caves(&mut world, &layout, &mut rand);
+        super::super::structures::caves(&mut world, &layout, &heights, &mut rand);
         (world, layout)
     }
 

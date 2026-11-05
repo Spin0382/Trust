@@ -112,6 +112,9 @@ use super::npc::{TILE, TileView};
 
 /// Terminal speed for anything that falls.
 const TERMINAL: f32 = 16.0;
+/// Falling blocks clamp lower than everything else: `if (velocity.Y > 10f) velocity.Y = 10f`
+/// (`Projectile.cs:59084-59088`).
+const FALLING_BLOCK_TERMINAL: f32 = 10.0;
 /// How long a style-1 projectile flies flat before gravity takes it.
 const ARC_DELAY: f32 = 15.0;
 /// ...and how hard it then falls.
@@ -907,9 +910,13 @@ pub fn step(
                 }
             }
             10 => {
-                // A lob: it falls from the moment it leaves, and slows as it goes.
-                projectile.velocity.1 = (projectile.velocity.1 + 0.41).min(TERMINAL);
-                projectile.velocity.0 *= 0.98;
+                // A falling block (`AI_010`, `Projectile.cs:58995-59008`): it drops under its own
+                // weight at 0.41 a tick, keeps its horizontal speed untouched, and stops
+                // accelerating at ten. This is the whole visible difference between vanilla's
+                // sand fall and a tile teleporting downward: the block needs about nine ticks to
+                // cross one empty tile, and the client draws a dust puff every other tick while it
+                // does.
+                projectile.velocity.1 = (projectile.velocity.1 + 0.41).min(FALLING_BLOCK_TERMINAL);
                 projectile.rotation += 0.1;
             }
             14 => {

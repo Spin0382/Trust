@@ -116,7 +116,7 @@ fn main() {
 
     timed!(
         "structures::caves",
-        structures::caves(&mut world, &plan, &mut rand)
+        structures::caves(&mut world, &plan, &heights, &mut rand)
     );
     timed!(
         "structures::ores",
@@ -314,11 +314,11 @@ fn main() {
     timed!("thin_ice::crust", thin_ice::crust(&mut world, &plan));
     timed!(
         "wall_variety::variety",
-        wall_variety::variety(&mut world, &plan, &mut rand)
+        wall_variety::variety(&mut world, &plan, &heights, &mut rand)
     );
     timed!(
         "wall_variety::enclosed_spaces",
-        wall_variety::enclosed_spaces(&mut world, &plan, &mut rand)
+        wall_variety::enclosed_spaces(&mut world, &plan, &heights, &mut rand)
     );
     timed!("moss::scatter", moss::scatter(&mut world, &plan, &mut rand));
     timed!("moss::hang_long_moss", moss::hang_long_moss(&mut world));

@@ -24,6 +24,14 @@ pub struct Config {
     pub world_width: i32,
     pub world_height: i32,
     pub seed: u64,
+    /// Whether [`seed`](Self::seed) was actually chosen by a file, the environment or a flag,
+    /// rather than left at its default.
+    ///
+    /// A generated world with no seed chosen gets a random one, which is what `--help` promises
+    /// and what vanilla's empty seed field does. The default value itself is zero and has to stay
+    /// reproducible: an explicit `seed = 0` is a real seed and must not turn into a random world.
+    #[serde(skip)]
+    pub seed_was_set: bool,
     pub motd: String,
     /// Password clients must send before joining. Empty means the server is open.
     pub password: String,
@@ -121,6 +129,7 @@ impl Default for Config {
             world_width: crate::world::worldgen::SMALL_WIDTH,
             world_height: crate::world::worldgen::SMALL_HEIGHT,
             seed: 0,
+            seed_was_set: false,
             motd: "Welcome to Terrustia".into(),
             password: String::new(),
             max_chat_len: 500,
@@ -187,7 +196,10 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let config: Config = toml::from_str(&text)?;
+                let mut config: Config = toml::from_str(&text)?;
+                config.seed_was_set = toml::from_str::<toml::Table>(&text)
+                    .map(|table| table.contains_key("seed"))
+                    .unwrap_or(false);
                 config.validate()?;
                 Ok(config)
             }
@@ -250,6 +262,7 @@ impl Config {
         }
         if let Some(v) = get("TERRUSTIA_SEED") {
             self.seed = parsed("TERRUSTIA_SEED", &v)?;
+            self.seed_was_set = true;
         }
         if let Some(v) = get("TERRUSTIA_MOTD") {
             self.motd = v;
@@ -456,6 +469,33 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    /// The default seed is zero, but only a seed a file actually names counts as chosen: a world
+    /// generated with no seed gets a random one instead of silently reusing that zero.
+    #[test]
+    fn only_a_seed_written_in_the_file_marks_itself_explicit() {
+        let dir =
+            std::env::temp_dir().join(format!("terrustia-config-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let with_seed = dir.join("with.toml");
+        std::fs::write(&with_seed, "seed = 0\n").unwrap();
+        let config = Config::load(&with_seed).unwrap();
+        assert_eq!(config.seed, 0);
+        assert!(
+            config.seed_was_set,
+            "an explicit zero is a chosen seed, not a missing one"
+        );
+
+        let without_seed = dir.join("without.toml");
+        std::fs::write(&without_seed, "motd = \"hi\"\n").unwrap();
+        assert!(!Config::load(&without_seed).unwrap().seed_was_set);
+
+        let missing = dir.join("does-not-exist.toml");
+        assert!(!Config::load(&missing).unwrap().seed_was_set);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

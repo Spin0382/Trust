@@ -96,10 +96,13 @@ impl GameServer {
             id <= id::PLAYER_SPAWN || HANDSHAKE_EXTRAS.contains(&id)
         };
         if !allowed {
-            debug!(
+            // Info, not debug: this is what a connection dies of, and the kick text the player
+            // sees names no packet. Without the id here, "sent that too early" is unactionable.
+            info!(
                 slot,
                 id,
                 name = id::name(id),
+                state = ?player.state,
                 "refusing a packet from a connection that has not finished joining"
             );
             self.kick(slot, "Your client sent that too early.");
@@ -108,6 +111,30 @@ impl GameServer {
     }
 
     pub(super) fn handle_packet(&mut self, slot: u8, frame: Frame) {
+        // `MessageBuffer.GetData` returns before its state gate for any id past `MessageID.Count`
+        // (`MessageBuffer.cs:139-142`), which is how a vanilla server ignores a mobile client's
+        // extra messages instead of kicking them. The phone sends id 164 right after its player
+        // info; this server has no arm for it and neither does the PC game, so it is dropped here
+        // and nothing else happens.
+        if frame.id >= id::PC_MESSAGE_COUNT {
+            if self.player(slot).is_some_and(|p| !p.is_playing()) {
+                info!(
+                    slot,
+                    id = frame.id,
+                    len = frame.payload.len(),
+                    head = ?&frame.payload[..frame.payload.len().min(12)],
+                    "ignoring a packet id outside the PC table"
+                );
+            } else {
+                debug!(
+                    slot,
+                    id = frame.id,
+                    len = frame.payload.len(),
+                    "ignoring a packet id outside the PC table"
+                );
+            }
+            return;
+        }
         if !self.handshake_allows(slot, frame.id) {
             return;
         }
@@ -290,7 +317,28 @@ impl GameServer {
                 self.on_town_npc_name_request(slot, &payload)
             }
             other => {
-                debug!(slot, id = other, name = id::name(other), "ignoring packet");
+                // Mobile builds send ids past the PC table; `handshake_allows` lets them through
+                // only so the join can finish, and there is nothing here to run for them. Log
+                // them at info while the connection is still joining, because that is the one
+                // place a person debugging "the phone will not connect" can see what it sent.
+                if self.player(slot).is_some_and(|p| !p.is_playing()) {
+                    info!(
+                        slot,
+                        id = other,
+                        len = payload.len(),
+                        head = ?&payload[..payload.len().min(12)],
+                        "ignoring an unknown packet before the join finished"
+                    );
+                } else {
+                    debug!(
+                        slot,
+                        id = other,
+                        name = id::name(other),
+                        len = payload.len(),
+                        head = ?&payload[..payload.len().min(12)],
+                        "ignoring packet"
+                    );
+                }
                 Ok(())
             }
         };
@@ -575,7 +623,7 @@ impl GameServer {
     fn finish_join_stream(&mut self, slot: u8) {
         if self
             .player(slot)
-            .is_none_or(|p| p.state >= ConnState::TilesSent)
+            .is_none_or(|p| p.join_tail_sent || p.state < ConnState::WorldSent)
         {
             return;
         }
@@ -636,6 +684,7 @@ impl GameServer {
         }
 
         if let Some(player) = self.player_mut(slot) {
+            player.join_tail_sent = true;
             player.advance_to(ConnState::TilesSent);
         }
         match packets::empty(id::INITIAL_SPAWN) {
@@ -811,7 +860,7 @@ impl GameServer {
     fn on_request_section(&mut self, slot: u8, payload: &[u8]) -> terrustia_proto::Result<()> {
         if self
             .player(slot)
-            .is_none_or(|p| p.state < ConnState::TilesSent)
+            .is_none_or(|p| p.state < ConnState::WorldSent)
         {
             return Ok(());
         }
@@ -867,7 +916,13 @@ impl GameServer {
         let was_playing = self.player(slot).is_some_and(Player::is_playing);
 
         if let Some(player) = self.player_mut(slot) {
-            if player.state < ConnState::TilesSent {
+            // Vanilla accepts packet 12 as soon as world data has gone out (`State < 3` is the
+            // only refusal, `MessageBuffer.cs:925`), and advances to the playing state right
+            // there, without waiting for the section stream it started. Waiting for `TilesSent`
+            // here instead meant a client that spawns during loading — the mobile client does —
+            // was silently ignored, and its first controls packet, id 13, then tripped the
+            // handshake guard and earned "Your client sent that too early."
+            if player.state < ConnState::WorldSent {
                 return Ok(()); // spawning before the world arrived is not a valid sequence
             }
             player.team = spawn.team;
@@ -2288,6 +2343,7 @@ impl GameServer {
         // tile's whole state — not just the field this particular edit happened to change.
         let before = tile;
         let mut changed = true;
+        let mut world_changed = false;
         let mut broke = None;
 
         match edit.kind() {
@@ -2303,6 +2359,7 @@ impl GameServer {
                     if section_owned && self.mine_framed_boulder(slot, x, y, tile, drops_item) {
                         // Every cell, the tile log and the drop have already been handled.
                         changed = false;
+                        world_changed = true;
                     } else {
                         if tile.is_active() && drops_item {
                             // The frames go with the block. Everything that decides what a broken
@@ -2383,6 +2440,7 @@ impl GameServer {
             if let Some(name) = self.player(slot).map(|p| p.name.clone()) {
                 self.tile_log.record(x, y, before, &name);
             }
+            world_changed = true;
         }
         // Gated on `section_owned`, not `changed`: a rejected edit still leaves `broke` set to
         // whatever the match arm above decided a real kill would drop, and applying these side
@@ -2410,6 +2468,9 @@ impl GameServer {
             if block == BEE_LARVA {
                 self.wake_from_tile(x, y, QUEEN_BEE);
             }
+        }
+        if section_owned && world_changed {
+            self.settle_falling_sand_after_edit(x, y);
         }
 
         // Relay regardless: even an edit the server does not model must reach other clients, or
@@ -7858,6 +7919,96 @@ mod server_side_effects {
     }
 }
 
+/// A client is allowed to spawn before its section stream has finished, as vanilla allows, and the
+/// join tail still has to follow once the stream drains.
+#[cfg(test)]
+mod early_spawn {
+    use super::*;
+    use crate::config::Config;
+
+    fn spawn_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(0);
+        payload.extend_from_slice(&(-1i16).to_le_bytes());
+        payload.extend_from_slice(&(-1i16).to_le_bytes());
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.extend_from_slice(&0i16.to_le_bytes());
+        payload.extend_from_slice(&0i16.to_le_bytes());
+        payload.push(0);
+        payload.push(PlayerSpawn::CONTEXT_SPAWNING_INTO_WORLD);
+        payload
+    }
+
+    #[test]
+    fn a_spawn_packet_while_sections_stream_is_accepted() {
+        let mut server = GameServer::new(
+            Config::default(),
+            crate::world::World::empty(200, 150, "early spawn"),
+        );
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().unwrap(), out_tx);
+        player.state = ConnState::WorldSent;
+        player.greeted = true;
+        player.password_ok = true;
+        player.pending_sections.push_back((0, 0));
+        server.players[0] = Some(player);
+
+        server
+            .on_player_spawn(0, &spawn_payload())
+            .expect("a valid spawn");
+
+        assert!(server.player(0).expect("the player").is_playing());
+        assert!(
+            server.handshake_allows(0, id::PLAYER_CONTROLS),
+            "controls must not be refused once the client has spawned"
+        );
+        assert!(
+            !server.player(0).expect("the player").join_tail_sent,
+            "the join tail still has to go out when the stream drains"
+        );
+
+        server.finish_join_stream(0);
+        assert!(server.player(0).expect("the player").join_tail_sent);
+    }
+
+    #[test]
+    fn a_mobile_only_packet_is_allowed_and_ignored_before_the_world() {
+        let mut server = GameServer::new(
+            Config::default(),
+            crate::world::World::empty(200, 150, "mobile packet probe"),
+        );
+        let (out_tx, _out_rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().unwrap(), out_tx);
+        player.state = ConnState::Identified;
+        player.greeted = true;
+        player.password_ok = true;
+        player.name = "SpinD".to_string();
+        server.players[0] = Some(player);
+
+        server.handle_packet(
+            0,
+            Frame {
+                id: 164,
+                payload: Bytes::from_static(&[1, 2, 3, 4]),
+            },
+        );
+
+        assert!(
+            server.player(0).is_some(),
+            "an unknown mobile extra must not end the connection"
+        );
+        assert_eq!(
+            server.player(0).expect("the player").state,
+            ConnState::Identified,
+            "and it must not advance the handshake by itself"
+        );
+        assert!(
+            !server.handshake_allows(0, id::PLAYER_CONTROLS),
+            "a real PC gameplay packet is still refused before spawn"
+        );
+    }
+}
+
 /// Vanilla's join loop sends a `21` and then a `22` for every live item
 /// (`MessageBuffer.cs:843-850`, case 8). This sent only the `21`, so a joining client believed
 /// every item on the ground was free to take: it would walk up to one already reserved for
@@ -8238,6 +8389,64 @@ mod player_luck {
 }
 
 #[cfg(test)]
+mod falling_sand_after_edit {
+    use super::*;
+    use crate::config::Config;
+
+    #[test]
+    fn mining_the_support_under_sand_drops_it_as_a_falling_projectile() {
+        let mut world = crate::world::World::empty(200, 150, "sand trigger probe");
+        world.set_tile(100, 100, Tile::block(53));
+        world.set_tile(100, 101, Tile::block(1));
+        world.set_tile(100, 102, Tile::block(1));
+
+        let mut server = GameServer::new(Config::default(), world);
+        let (tx, _rx) = mpsc::channel(64);
+        let mut player = Player::new(0, "127.0.0.1:1".parse().expect("test address"), tx);
+        player.state = ConnState::Playing;
+        player
+            .sent_sections
+            .insert(server.world.section_of(100, 100));
+        server.players[0] = Some(player);
+
+        let edit = TileManipulation {
+            action: 0,
+            x: 100,
+            y: 101,
+            arg: 0,
+            style: 0,
+        };
+        let frame = edit.encode().expect("encode a tile edit");
+        server
+            .on_tile_manipulation(0, &frame[3..])
+            .expect("the kill should be accepted");
+
+        assert!(
+            !server.world.tile(100, 100).is_active(),
+            "the sand above the mined support becomes a projectile"
+        );
+        assert_eq!(
+            server.projectiles.len(),
+            1,
+            "exactly one block was released"
+        );
+
+        for _ in 0..120 {
+            server.tick_projectiles();
+            if server.projectiles.is_empty() {
+                break;
+            }
+        }
+        assert!(server.projectiles.is_empty(), "and it lands");
+        assert_eq!(
+            server.world.tile(100, 101).block,
+            53,
+            "in the hole the mined block left"
+        );
+    }
+}
+
+#[cfg(test)]
 mod boulder_mining {
     use super::*;
     use crate::config::Config;
@@ -8333,6 +8542,34 @@ mod boulder_mining {
             Some(item.item.id),
             terrustia_proto::placed_items::placed_item(BOULDER, 0),
             "the item must be the one a boulder of this style is worth"
+        );
+    }
+
+    /// A mined boulder does not just vanish into an item: it becomes the rolling projectile.
+    ///
+    /// `WorldGen.KillTile`'s switch (`WorldGen.cs:50097`, `case 138`) launches
+    /// `ProjectileID.Boulder` at `x * 16 + 15.5`, `y * 16 + 16` from the object's top-left cell,
+    /// at rest, at damage 70. Before this the tile cleared and dropped and the boulder never
+    /// rolled, so a boulder trap could be disarmed by mining it from below.
+    #[test]
+    fn mining_a_boulder_launches_the_rolling_boulder() {
+        let (mut server, _rx, _cells) = server_with_boulder();
+        mine(&mut server, 101, 100); // the bottom-right cell, not the anchor
+        let (_, rolling) = server
+            .projectiles
+            .iter()
+            .find(|(_, p)| p.projectile_type == 99)
+            .expect("a freed boulder must launch the rolling projectile");
+        assert_eq!(rolling.damage, 70, "the launch damage is vanilla's own");
+        assert_eq!(
+            rolling.velocity,
+            (0.0, 0.0),
+            "it starts at rest; the arm is what gives it gravity"
+        );
+        assert_eq!(
+            rolling.center(),
+            (100.0 * 16.0 + 15.5, 99.0 * 16.0 + 16.0),
+            "and from the centre of the 2x2, not from the cell that was hit"
         );
     }
 }

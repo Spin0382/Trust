@@ -18,26 +18,37 @@ Every `.wld` ends its header with a JSON manifest: all 106 generation passes, **
 order**, each with a `RandNext` — `WorldGen.genRand.Next()` sampled immediately after that pass
 (`WorldGenerator.cs:515`).
 
-Because the generator is **never reseeded** during generation, the value recorded after pass N is
-a fingerprint of every draw made by passes 1 to N. So:
+The game reseeds the generator from the world seed at the **start of every pass**
+(`WorldGenerator.cs:499`), so `RandNext` fingerprints the draws that pass made, not the whole
+prefix before it. A pass that draws nothing records the seed's own first draw; the reference world
+records `143337951` for both "Wavy Caves" and "Mud Caves To Grass", which is the first value for
+seed 12345. So:
 
-> Implement pass N, generate with the same seed, compare. If it matches, the RNG consumption of
-> the whole prefix is exactly right. If it does not, the first pass that disagrees is the one that
-> is wrong.
+> Implement pass N, generate with the same seed, compare. If it matches, that pass's draw count
+> and order are exactly right. If it does not, the pass that disagrees is the one that is wrong.
 
-That turns a 106-link chain — where nothing can be judged until all of it is done — into something
-checkable one pass at a time. Without it the port is unfalsifiable.
+That turns a 106-link sequence — where nothing can be judged until all of it is done — into
+something checkable one pass at a time. Without it the port is unfalsifiable.
 
 ```sh
 cargo run --release -p terrustia --example genparity -- reference.wld
+cargo run --release -p terrustia --example genparity -- reference.wld --counts
 ```
+
+`--counts` decodes every recorded pass back into the number of draws that pass took, which turns
+the reference world into a per-pass budget. For seed 12345 on a 4200x1200 world the range is wide
+and not obvious from the code: **twelve passes draw nothing at all**, `Lakes` draws 453, `Mount
+Caves` 780, `Clay` half a million, `Rock Layer Caves` 6.8 million, and `Jungle` more than the 40
+million the scan reaches. The 105 passes it can decode come to 76.2 million draws, so Jungle alone
+is at least a third of the whole generation and twelve passes are free. "Port the next pass" means
+very different amounts of work depending on which one it is.
 
 Two further properties worth knowing:
 
 - **Sampling advances the generator.** A port has to take a draw at the same point or it diverges
-  from the very first pass.
+  from that pass's recorded value.
 - **A skipped pass records nothing and consumes zero RNG.** So generating a reference with a pass
-  disabled, and stubbing that pass to draw nothing, matches exactly for every pass after it.
+  disabled, and stubbing that pass to draw nothing, matches exactly for that pass.
   Deferring a pass is therefore *free*, not fatal.
 
 ## What is done
@@ -46,18 +57,149 @@ Two further properties worth knowing:
   and seven sequences match a second implementation written separately from the same source.
 - `TranslateSeed`: parse as an integer, else CRC32.
 - The manifest reader, hand-written to avoid a JSON dependency.
-- `genparity`, which reads a reference world's seed and pass record and names the first divergence.
+- `genparity`, which reads a reference world's seed and pass record and reports every implemented
+  pass against it, with the reference's draw count and first draws for any that disagree.
+- `WorldGen.Reset` for an ordinary world: the seed's draws up to the first pass, including the
+  tree, cave and background styles, moon, ore tiers, dungeon side and column, jungle and snow
+  origins, and both beach ends. Every value it produces for the reference world matches that
+  world's own header (tree/cave styles, backgrounds, moon, clouds, wind, world id, ore tiers).
+- `TerrainPass`, the first pass: all five surface shapes, `SurfaceHistory`, the surface and rock
+  layer calculations, `FillColumn`, `RetargetColumn`, `RetargetSurfaceHistory`,
+  `GenerateWorldSurfaceOffset`, and the beach padding (`FlatBeachPadding = 5`).
+- `Dunes`, which is `DunesBiome.Place`: the sand hills, the pyramid sites, and the 112 draws that
+  make the reference world's dunes tile-for-tile.
+- `Ocean Sand`, `Sand Patches` and `Tunnels`, on the shared `WorldGen.TileRunner` port.
+- `Mount Caves`, `Dirt Wall Backgrounds`, `Rocks In Dirt`, `Dirt In Rocks` and `Clay`.
+- `Small Holes`, `Dirt Layer Caves` and `Rock Layer Caves`, on the carving half of `TileRunner`
+  that the layer passes did not need.
+- `Surface Caves`, which needed `WorldGen.digTunnel` and `WorldGen.Caverer` - the worm-shaped caves,
+  whose diamond radius breathes between 60% and 200% of its start as the tunnel runs.
+- `Wavy Caves`, which is a registered no-op: its whole body is gated on the Don't Starve seed, and
+  the pass still has to occupy its manifest slot.
+- `Generate Ice Biome`, whose `snowMinX`/`snowMaxX` walk the later ice passes read back, and
+  `Grass`, which converts a dirt pocket only when all four of its neighbours are dirt.
+- `Mud Caves To Grass`, which draws nothing on an ordinary seed: it spreads jungle grass
+  recursively through mud (capped at 1000 nested calls) and removes connected solid clumps
+  shorter than 20 tiles. The stepped world check for pass 19 is clean in every tile.
+- `Jungle`, the largest pass in the manifest: three mud blobs with their gem pockets, the
+  10,000-step mud runner, the `KillTile` worm up to the surface, the 1,050 mud-wall holes, and the
+  finishing-touches loops. It needed three pieces of `TileRunner` the earlier passes never reached
+  (`GenVars.mudWall` and its walls 15/64, the type-59 stop at the top of the world, and the type-59
+  vertical steering), plus `WorldGen.KillTile` and `PlaceWall`.
 
-Against a reference world it currently reports:
+Against the reference world (4200x1200, crimson, seed text `12345`) it now reports:
 
 ```
 passes    106 recorded, 106 ran, 0 skipped
-the first to write is "Terrain", whose generator should read 9436581 afterwards.
+19/106 recorded passes are implemented, and 19 of those match the reference's draw stream.
+every implemented pass matches.
+next to write: "Full Desert"
 ```
+
+and the tile check below says our world is **identical to vanilla's after each pass it has a step
+file for**, in every field a `.wld` can carry: passes 1 to 14 and 16 to 19. There is no step 15,
+because `Wavy Caves` draws nothing and changes nothing, so its world would be step 14's again.
+
+### Two oracles, because one is not enough
+
+The comparison runs every implemented pass rather than stopping at the first disagreement, because
+each pass is reseeded and its `RandNext` is therefore its own proof. That mattered immediately:
+"Dirt Wall Backgrounds" matches while "Mount Caves", the pass before it, does not.
+
+`RandNext` says nothing about tiles, and from pass 6 onward several passes branch on them. Mount
+Caves screens a 100 by 50 box around the first solid tile in its column and refuses to dig if it
+finds sand, so its draw count is a function of the terrain. The reference drew 780 numbers there and
+we drew 384, which decodes cleanly: vanilla dug in all four attempts and we dug in two. That is a
+tile difference reporting itself as an RNG difference, and the rest of this section is about how it
+got found - the diagnosis first written here ("our surface sits lower than vanilla's") was wrong,
+which is exactly why the tool below was worth building.
+
+The reference world cannot settle it, because by then it has had all 106 passes applied to it: the
+same column shows later Crimstone and caves where pass 6 saw untouched ground. So the tool that was
+missing was vanilla's tile state *entering* pass N.
+
+That tool now exists, and it is a two-line idea: truncate the pass list and let the game save. A
+Mono.Cecil patch on `WorldGenerator/Controller::get_Passes` - the property the generation loop
+reads through (`foreach (GenPass item in Passes.Skip(num))`, `WorldGenerator.cs:133`) - calls
+`RemoveRange(stop, Count - stop)` on the list before returning it. The patched server then generates
+a world that genuinely stopped after pass N and writes it through the normal save path. The recipe,
+including the `-autocreate 1` / nonexistent `-world` invocation that the server actually needs, is
+in `.scratch/oracle/README.md`; the tooling lives there too, because it requires a local Terraria
+install and can no more be committed than the decompiled tree that `just regen` reads.
+
+(The shipped `Terraria.Testing/QuickLoad.cs` looks like a patch-free route to the same thing: it
+sets `SnapshotFrequency` and `PauseAfterPass` from a JSON file. It is not reachable headless - its
+load path runs from the client's splash screen and calls `MessageBox.Show` - and
+`DebugOverrides`, the other candidate, is `[Conditional("DEBUG")]` and so absent from the shipped
+assembly.)
+
+`genparity --passes N --diff <stopped world>` compares what our passes built against what vanilla's
+did, on the surface row, the dirt-to-stone row, the active-tile count per type and the first
+differing coordinates. `every_stepped_reference_world_is_reproduced_tile_for_tile` is the same
+check as a test: it walks the registry once and asserts total equality with every step file it has.
+
+The draw-stream half is committed, so a hosted runner can check it without an install.
+`crates/terrustia/src/world/worldgen/reference-manifest.json` is the reference world's header
+manifest verbatim: 106 entries, 9.5 KB, each one a pass name, the generator's value immediately
+after that pass, whether it was skipped, and how long the run took.
+`the_registered_passes_match_the_reference_draw_stream` reads it and asserts the whole registry
+against it, which is the same comparison the `genparity` example prints - a gate now rather than a
+verdict written down by hand each time. What still needs a local install is the tile half: the step
+files are ordinary 1.5 MB world saves of a world only the real generator can make, so that test
+skips in CI and runs here.
+
+A third mode of the same patch answers a different question: `WGpatch <in> <out> trace` rewrites
+`WorldGen.TileRunner` to print its nine arguments, and the position the walk finished on, every time
+it is called. That is ground truth for the *shape* of a pass rather than its total, and it is what
+localised the Jungle divergence: the first blob matched exactly, the second did not, so the fault
+was inside the first blob's runner and not in the pass's orchestration. Comparing the argument list
+the reference used against the one the port uses is a one-line diff of two files, and it is worth
+reaching for before reasoning about per-tile branch order.
+
+Two of the three bugs it found are invisible to any amount of RNG checking, because neither changes
+a single draw:
+
+- **`Main.worldSurface` and `GenVars.worldSurface` are different numbers on the same world**, 331
+  and 267. The port fed the `GenVars.` one to passes whose source reads `Main.`'s: Sand Patches
+  picks its depth band from `Main.worldSurface` and `Main.rockLayer`, so every patch sat about 64
+  rows too shallow; Mount Caves walks columns to `Main.worldSurface`; Dirt Wall Backgrounds paints
+  to `Main.worldSurface + 10`. `RunnerContext::ordinary` now builds that context in one place.
+- **`(int)double.NaN` is `int.MinValue` in .NET, not 0.** Under a dune's edge the sand depth is
+  `(int)(Math.Sqrt(from_edge) * 3.0)` with `from_edge` negative, so vanilla's floor is a
+  billion-ish rows up and the fill loop never runs. Rust's `as` saturates NaN to 0, which painted a
+  23-tile skirt of sand on the nine columns left of the reference world's largest dune.
+
+The third was visible to the draw oracle but only as a number: Rocks In Dirt was 4,125 draws long,
+and it is the one pass so far written as `for (int i = 0; (double)i < num; i++)` over a **double**
+count rather than `i < (int)num`. `5,040,000 * 0.00015` evaluates to 755.9999999999999, so vanilla
+runs 756 times and a truncating cast runs 755. The missing band-1 runner was the whole difference,
+and it is why the loop in that pass keeps its bound as an `f64`.
+
+Two more were found by the Jungle pass, and they are the reason it is worth writing down that
+**`Framing.WallFrame` draws from `genRand`**:
+
+- **`WorldGen.PlaceWall` ends with `SquareWallFrame`, which re-rolls the wall's frame number from
+  `genRand.Next(0, 3)`** (`WorldGen.cs:75751`, `Framing.cs:396-402`). `SquareWallFrame` passes its
+  `resetFrame` only to the centre cell, so each *successful* wall placement costs exactly one draw
+  (two for wall 21). The Jungle pass places hundreds of thousands of walls, so the port was 5.17
+  million draws short and every tile after the first wall was wrong. The same applies to
+  `SquareTileFrame`, whose block framing rolls `frameNumber` the same way, which no pass has needed
+  yet.
+- **`MudWallRunner` tests `Main.worldSurface`, while `GenerateHolesInMudWalls` picks its search box
+  from `GenVars.worldSurface`** (`WorldGen.cs:78172` against `JunglePass.cs:205`). The two differ by
+  64 rows here. Feeding the wrong one to the runner erased the surface dirt wall across the whole
+  jungle - 312 tiles, no draw changed.
+
+With those fixed, every registered pass matches the reference draw stream, and the tile check
+is clean through pass 18. One caveat belongs with it: the comparison covers only what the file format
+can express. A `TileRunner` with `addTile` false writes its type onto inactive tiles too and the game
+keeps that in memory, but a `.wld` has no room for a block under an inactive tile, so a loaded
+reference reads 0 there and the test ignores that half rather than failing on a difference the
+shipped server could not send either.
 
 ## What is not
 
-The 106 passes themselves. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
+The other 87 passes. Sizing, honestly: **219–372 engineer-days, plan against 300** — 14 to
 20 months at full time. The earlier estimate of 80–120 was too optimistic by roughly a factor of
 three.
 
@@ -106,6 +248,7 @@ still the terrain spine.
 
 ## What is needed from a human
 
-One or two worlds generated in **Terraria 1.4.5.8** at known numeric seeds, both evils, a small
-and a large. The worlds on disk are 1.4.5.6 (format 319) and older; the target is 326. Work can
-start against the old one — parity just cannot be *certified* with it.
+The Terrain work was checked against a **Terraria 1.4.5.8** world (4200x1200, crimson, seed text
+`12345`), the version and evil this port targets. A second world at another size and the other
+evil would still be valuable: a mistake that happens to agree at 4200/crimson, such as a wrong
+`GetWorldSize()` branch, would otherwise stay invisible.

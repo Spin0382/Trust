@@ -43,6 +43,7 @@ use terrustia_proto::{Liquid, Tile, TileFlags, tile_solid};
 
 use super::genpipe::{Action, Ctx, Link, Shape, chain, gen_shape, gen_shape_out};
 use super::layout::Layout;
+use super::passes::{DungeonSide, GenVars};
 use super::rand::UnifiedRandom;
 use super::structure_map::{Rect, StructureMap};
 use crate::world::World;
@@ -102,9 +103,10 @@ impl FastRandom {
     }
 
     pub fn next(&mut self, max: i32) -> i32 {
-        if max <= 0 {
-            return 0;
-        }
+        debug_assert!(max >= 0, "the game throws on a negative maximum");
+        // `FastRandom.cs:65` tests the power-of-two case with `(max & -max) == max`, which is true
+        // for zero, and the branch then multiplies by `NextBits(31)`: a `Next(0)` consumes a draw
+        // and returns 0. Returning early for zero would desync the stream from vanilla's.
         if (max & max.wrapping_neg()) == max {
             return ((i64::from(max) * i64::from(self.next_bits(31))) >> 31) as i32;
         }
@@ -124,7 +126,11 @@ impl FastRandom {
 /// with plain sandstone while leaving its old `frame_x`/`frame_y` behind leaves the running world
 /// holding frames that a save drops, because the format only stores them for frame-important
 /// types. That is 17 tiles differing across a save, which is how this was found.
+/// `Tile.ResetToType` (`Tile.cs:250-258`): liquid to nothing, the header back to plain active, no
+/// slope, no paint, frame cleared, then the type. Clearing the liquid is part of it, and the
+/// `.wld` comparison reads the amount, so forgetting it leaves water in cells vanilla drains.
 fn reset_to_type(t: &mut Tile, block: u16) {
+    t.liquid = 0;
     t.block = block;
     t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
     t.slope = 0;
@@ -162,9 +168,17 @@ impl Description {
     }
 }
 
-/// `SurfaceMap.FromArea`, restricted to what this module needs. Shares its shape with
-/// `dunes::SurfaceMap`; kept separate because that one is private to its own module and this one
-/// also needs the average and the bottom.
+/// `SurfaceMap.FromArea` (`Terraria.GameContent.Biomes.Desert/SurfaceMap.cs:44-74`) plus the
+/// constructor's clamp (`:22-42`), returning the heights, the average and the bottom.
+///
+/// Two details matter and the earlier version of this function had neither. A cloud tile does not
+/// end the scan, it *reopens* it: vanilla sets the flag back to false on a cloud and then the
+/// following `if (!flag)` immediately pushes the column's height to `maxTilesY / 2 + 50`, so a
+/// column under a cloud reads as open ground until another active tile lands lower. And the
+/// bottom is clamped by `Main.worldSurface - 10` (`:35-37`), which caps how deep a desert can be
+/// sited on a world whose hills dip low. Without that clamp the hive sits below where vanilla
+/// puts it, and the sand the mound lays down then ends up over air, which is how ~30k cells came
+/// out as hardened sand instead of sand in the pass-20 tile diff.
 fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) {
     let half = world.height() / 2;
     let mut heights = Vec::with_capacity(width.max(0) as usize);
@@ -172,12 +186,19 @@ fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) 
     let mut bottom = 0;
     for i in start_x..start_x + width {
         let mut found = false;
-        let mut height = half + 50;
+        let mut height = 0;
         for j in 50..50 + half {
             let t = world.tile(i, j);
-            if t.is_active() && !matches!(t.block, 189 | 196 | 460 | 717 | 718 | 719) && !found {
-                height = j;
-                found = true;
+            if t.is_active() {
+                if is_cloud(t.block) {
+                    found = false;
+                } else if !found {
+                    height = j;
+                    found = true;
+                }
+            }
+            if !found {
+                height = half + 50;
             }
         }
         sum += i64::from(height);
@@ -189,36 +210,50 @@ fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) 
     } else {
         sum as f64 / heights.len() as f64
     };
+    let world_surface = f64::from(world.surface);
+    let bottom = if f64::from(bottom) > world_surface - 10.0 {
+        i32::from(world.surface) - 10
+    } else {
+        bottom
+    };
     (heights, average, bottom)
 }
 
-/// `DesertDescription.CreateFromPlacement` (`:54-91`). `None` where vanilla returns `Invalid`.
+/// `TileID.Sets.Clouds` (`TileID.cs:197`).
+fn is_cloud(block: u16) -> bool {
+    matches!(block, 189 | 196 | 460 | 717 | 718 | 719)
+}
+
+/// `DesertDescription.CreateFromPlacement` (`:43-84`). `None` where vanilla returns `Invalid`.
 pub fn describe(
     world: &World,
-    layout: &Layout,
     rand: &mut UnifiedRandom,
     origin: (i32, i32),
+    skip_tile_check: bool,
 ) -> Option<Description> {
-    let scale = f64::from(layout.width) / 4200.0;
+    let scale = f64::from(world.width()) / 4200.0;
     let columns = (80.0 * scale) as i32;
     let rows = ((rand.next_double() * 0.5 + 1.5) * 170.0 * scale) as i32;
     let width = (BLOCK_SCALE.0 * f64::from(columns)) as i32;
     let height = (BLOCK_SCALE.1 * f64::from(rows)) as i32;
-    if width < 10 || height < 10 {
-        return None;
-    }
     let x = origin.0 - width / 2;
 
     let (heights, average, bottom) = surface_map(world, x - 5, width + 10);
-    // Refuse a site whose floor row runs through jungle, snow or ice.
-    for i in x..x + width {
-        let t = world.tile(i, bottom).block;
-        if matches!(t, 59 | 60 | 161 | 147) {
-            return None;
+    // `DesertDescription.Cleanup` is `RowHasInvalidTiles`, and `skipDesertTileCheck` short-circuits
+    // it before the scan (`DesertDescription.cs:88`): once the desert has failed twice into a
+    // flip of the dungeon side, every later site is accepted whatever runs through its floor row.
+    if !skip_tile_check {
+        for i in x..x + width {
+            let t = world.tile(i, bottom).block;
+            if matches!(t, 59 | 60 | 161 | 147) {
+                return None;
+            }
         }
     }
 
-    let top = (average as i32 + bottom) / 2;
+    // Vanilla is `(int)(Average + (double)Bottom) / 2`: the cast binds before the divide, so the
+    // sum is truncated once and then divided as integers.
+    let top = (average + f64::from(bottom)) as i32 / 2;
     let y = top + rand.next_range(40, 60);
     Some(Description {
         combined: Rect::new(x, top, width, y + height - top),
@@ -232,7 +267,20 @@ pub fn describe(
 }
 
 /// `SandMound.Place` (`:7-50`): scoop the surface out and fill the bowl with sand.
+///
+/// The rectangles are taken at face value: the game's `Rectangle.Bottom` and `.Right`
+/// (`Microsoft.Xna.Framework`, i.e. FNA) are `Y + Height` and `X + Width`, one past the last
+/// covered cell, which is the same convention as this crate's `Rect::bottom()` and `Rect::right()`.
+/// That is worth stating because the opposite reading is the natural one from `System.Drawing`, and
+/// it was tried here: treating them as inclusive moves this pass from 1,402 draws short of the
+/// reference to 3,211 short and takes the hive's wall count 1,811 cells off, while the exclusive
+/// reading lands it exactly (`wall 187: ours 105,138, theirs 105,138`).
 fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
+    // `.NET Rectangle.Bottom` in the game's own XNA-derived `Rectangle` is `Y + Height`, one past
+    // the last covered row - the same convention as this crate's `Rect::bottom()` - which is why
+    // `DesertHive.cs:266` can write `i < area.Right` and cover exactly `Width` columns, and why
+    // `HouseBuilder.cs:612` has to subtract one from `Rooms.Max(r => r.Right)`. The mound is
+    // therefore transcribed directly, with no adjustment.
     let mut bowl = d.desert;
     bowl.height = d.desert.height.min(d.hive.height / 2);
     let mut lower = d.desert;
@@ -267,7 +315,9 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
                 }
             }
         }
-        // `PlaceSandColumn`.
+        // `PlaceSandColumn`: `height = desert2.Bottom - num5` with the inclusive bottom, and the
+        // loop writes `startY + height - 1` down to `startY`, so the top row written is one above
+        // `desert2.Bottom`.
         let height = lower.bottom() - floor;
         for j in (floor..floor + height).rev() {
             if !world.in_bounds(i + d.desert.x, j) {
@@ -277,6 +327,12 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
             t.liquid = 0;
             reset_to_type(&mut t, SAND);
             world.set_tile(i + d.desert.x, j, t);
+            // `SandMound.PlaceSandColumn` ends every tile of the column with
+            // `SquareWallFrame(startX, num2)` (`SandMound.cs:73`). Most of the time that is free,
+            // because the cell has no wall yet: `WallFrame` returns at `Framing.cs:346-351`. It is
+            // not free where the surface already carried a wall, and it is one of the terms the
+            // desert's draw total is made of.
+            let _ = super::tile_runner::square_wall_frame(&*world, rand, i + d.desert.x, j);
         }
     }
 }
@@ -397,18 +453,23 @@ fn place_clusters(
     world_seed: u64,
 ) {
     let area = d.hive.inflated(20);
-    let field = FastRandom::new(world_seed).with_modifier(57005);
+    // One stream for the whole field, advanced once per cell: `fastRandom.Next(3)` at
+    // `DesertHive.cs:280` consumes the shared instance, so the sand-versus-hardened-sand speckle
+    // depends on every previous cell. The wall test below uses a position-modified *copy*
+    // (`WithModifier(num4, num5)`, `:373`) and therefore does not advance it.
+    let mut field = FastRandom::new(world_seed).with_modifier(57005);
     let scale = (f64::from(d.hive.width), f64::from(d.hive.height));
     let grid = (f64::from(d.columns), f64::from(d.rows));
     let half = (BLOCK_SCALE.0 / 2.0, BLOCK_SCALE.1 / 2.0);
 
+    // `i < area.Right` in vanilla covers exactly `Width` columns, because the game's
+    // `Rectangle.Right` is `X + Width`; our `right()` is the same, so no adjustment here.
     for i in area.x..area.right() {
         for j in area.y..area.bottom() {
             if !world.in_bounds(i, j) {
                 continue;
             }
-            let mut speckle = field;
-            let block_type = if speckle.next(3) == 0 {
+            let block_type = if field.next(3) == 0 {
                 HARDENED_SAND
             } else {
                 SAND
@@ -431,9 +492,11 @@ fn place_clusters(
                 let mut sum = 0.0;
                 for b in cluster {
                     let d2 = (b.0 - at.0).powi(2) + (b.1 - at.1).powi(2);
-                    if d2 > 0.0 {
-                        sum += 1.0 / d2;
-                    }
+                    // Vanilla divides unconditionally (`DesertHive.cs:297`), so a cell that lands
+                    // exactly on a block source takes the infinity and the whole cell becomes an
+                    // open chamber (`num7 > 3.5`). Skipping the zero case here instead quietly
+                    // changes which cells are chambers.
+                    sum += 1.0 / d2;
                 }
                 if sum > best {
                     if best > second {
@@ -463,7 +526,7 @@ fn place_clusters(
                 }
             } else if strength > 1.8 {
                 t.wall = HIVE_WALL;
-                if j < layout_surface(d) {
+                if j < i32::from(world.surface) {
                     t.liquid = 0;
                 } else {
                     t.liquid_kind = Liquid::Lava;
@@ -482,7 +545,7 @@ fn place_clusters(
                 let chance = (strength - 0.25) / 0.45;
                 if local.next_double() < chance {
                     t.wall = HIVE_WALL;
-                    if j < layout_surface(d) {
+                    if j < i32::from(world.surface) {
                         t.liquid = 0;
                     } else {
                         t.liquid_kind = Liquid::Lava;
@@ -504,11 +567,6 @@ fn place_clusters(
     let _ = rand;
 }
 
-/// The desert's own top, used where vanilla reads `Main.worldSurface`.
-fn layout_surface(d: &Description) -> i32 {
-    d.desert.y
-}
-
 /// `DesertHive.AddTileVariance` (`:390-478`), minus the decorative placements that need objects
 /// this generator does not site underground.
 fn tile_variance(world: &mut World, d: &Description) {
@@ -524,8 +582,10 @@ fn tile_variance(world: &mut World, d: &Description) {
             let solid_below = below.is_active() && tile_solid::solid(below.block);
             let solid_below2 = below2.is_active() && tile_solid::solid(below2.block);
             if t.block == SAND && t.is_active() && (!solid_below || !solid_below2) {
+                // `DesertHive.cs:433-436` assigns `tile.type = 397` directly. It is not a
+                // `ResetToType`, so the liquid, the slope and the frames all stay as they were.
                 let mut t = t;
-                reset_to_type(&mut t, HARDENED_SAND);
+                t.block = HARDENED_SAND;
                 world.set_tile(x, y, t);
             }
         }
@@ -961,15 +1021,44 @@ fn pit_entrance(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
 }
 
 /// `DesertBiome.Place` (`:13-44`). Returns the area it claimed.
+///
+/// Where the pass's 237,989 draws go, measured on the reference world by snapshotting the
+/// generator around every stage (remeasure if a stage changes):
+///
+/// | stage | draws |
+/// |---|---|
+/// | siting, one attempt | 1 |
+/// | `describe` | 2 |
+/// | `sand_mound` | 23,339 |
+/// | entrance gate and body, then `clusters` | 29,781 |
+/// | `place_clusters` | 0 |
+/// | `add_tile_variance` | 22,731 |
+/// | `cleanup_area` | 160,733 |
+///
+/// Three things follow, and each one cost a wrong turn to learn. The mound's deterministic part is
+/// only 443 draws (330 columns, 113 of them taking a second roll where `i % 3 == 0`): the other
+/// 22,896 are `SquareWallFrame` per sand tile, which draw because the sand lands on ground that
+/// already has a cave wall behind it. `place_clusters` is entirely `FastRandom`
+/// (`DesertHive.cs:260`), so it cannot shift the reference stream by one number. And the entrance
+/// gate fails on this seed, so the entrance costs a single draw and nothing about
+/// `ChambersEntrance`'s 50-step spline or `Blotches` has anything to do with this pass's total.
+///
+/// Three things follow from that table and are worth knowing before debugging it. The mound's
+/// deterministic part is only 443 draws (`desert.Width + 10` columns, of which 113 take a second
+/// roll because `i % 3 == 0`): the other 22,896 are `SquareWallFrame` per sand column tile, which
+/// draws because underground cells carry a cave wall under the sand. `place_clusters` is entirely
+/// `FastRandom` (`DesertHive.cs:260`), so it cannot move the reference stream by even one number.
+/// And the entrance gate failed on this seed, which is why it costs one draw, so nothing about
+/// `ChambersEntrance`'s 50-step spline or `Blotches` explains this pass's draw count.
 pub fn place(
     world: &mut World,
-    layout: &Layout,
     structures: &mut StructureMap,
     rand: &mut UnifiedRandom,
     world_seed: u64,
     origin: (i32, i32),
-) -> Option<Rect> {
-    let mut d = describe(world, layout, rand, origin)?;
+    skip_tile_check: bool,
+) -> Option<Description> {
+    let mut d = describe(world, rand, origin, skip_tile_check)?;
     sand_mound(world, &d, rand);
     let (heights, _, _) = surface_map(world, d.combined.x - 5, d.combined.width + 10);
     d.surface = heights;
@@ -1000,15 +1089,340 @@ pub fn place(
     let groups = clusters(&d, rand);
     place_clusters(world, &d, &groups, rand, world_seed);
     tile_variance(world, &d);
+    add_tile_variance(world, rand, &d.hive);
+    cleanup_area(world, rand, &d.hive);
 
-    let area = Rect::new(
-        d.combined.x,
-        50,
-        d.combined.width,
-        (d.combined.bottom() - 20 - 50).max(1),
-    );
+    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20`, not that minus
+    // the `50` the rectangle starts at. The recorded area is therefore taller than the desert, and
+    // every later `CanPlace` test inside it is refused for rows that have no sand in them.
+    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 20);
     structures.add_structure(area, 10);
-    Some(d.combined.inflated(10))
+    Some(d)
+}
+
+/// `Main.tileSolid[484]`, as this pass sees it: the very first statement of Full Desert sets it
+/// false (`WorldGen.cs:12549`), so a boulder is not a floor for anything placed later in the same
+/// pass. The table otherwise says solid, and the flag persists past the pass (later passes set it
+/// again), so it is modelled here rather than in the shared table.
+fn solid_in_desert(block: u16) -> bool {
+    block != 484 && tile_solid::solid(block)
+}
+
+/// `WorldGen.Place2x2` (`WorldGen.cs:51788-51880`) for the two types this loop uses it for, 484
+/// and 751.
+///
+/// The check and the write are not over the same cells, and that is not a mistranslation: vanilla
+/// tests the two-by-two *up and to the left* of the call (`i` in `x-1..x`, `j` in `y-1..y` all
+/// inactive, and `(i, y+1)` solid for the same two columns) and then writes the two-by-two *down
+/// and to the right*: `(x, y)`, `(x+1, y)`, `(x, y+1)`, `(x+1, y+1)`. `AddTileVariance` calls this
+/// at the cell above the sandstone, so the write lands half on the sandstone that was the support,
+/// which is exactly why a decorated cell stops looking like open air to the next iteration.
+///
+/// `Main.tileTable` would widen what counts as support and is not consulted: nothing the desert
+/// writes is a table. `SolidTile2`'s half-brick and actuator tests (`WorldGen.cs:70683`) are inert
+/// for the same kind of reason: this generator writes neither during generation, so only `slope`
+/// is tested and it is always zero here.
+fn place_2x2(world: &mut World, x: i32, y: i32, block: u16, style: i32) {
+    let (width, height) = (world.width(), world.height());
+    if x < 5 || x > width - 5 || y < 5 || y > height - 5 {
+        return;
+    }
+    for i in x - 1..x {
+        for j in y - 1..y {
+            if world.tile(i, j).is_active() {
+                return;
+            }
+        }
+        let support = world.tile(i, y + 1);
+        if !support.is_active() || !solid_in_desert(support.block) || support.slope != 0 {
+            return;
+        }
+    }
+    for k in 0..2 {
+        for l in 0..2 {
+            let mut t = world.tile(x + k, y + l);
+            t.block = block;
+            t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
+            t.frame_x = (k * 18) as i16;
+            t.frame_y = (style * 36 + l * 18) as i16;
+            world.set_tile(x + k, y + l, t);
+        }
+    }
+}
+
+/// `WorldGen.Place3x2` (`WorldGen.cs:52533-52660`) for type 187, the hanging sandstone brick.
+///
+/// `flag`, the single-row variant, belongs to type 14 style 25 and cannot hold here, so this is the
+/// two-row branch: three columns `x-1..x+2` by two rows `y-1..y+1` must all be inactive and the row
+/// under them must be solid, and for 186/187 that floor may not be a boulder
+/// (`InvalidTileForPilesOrSpeleothems`, `WorldGen.cs:39380-39394`) - which is why a 484 dropped by
+/// the second branch of the caller stops an 187 from landing next to it. Six cells are then
+/// written, the upper row with `frameY` 0 and the lower with 18.
+fn place_3x2(world: &mut World, x: i32, y: i32, block: u16, style: i32) {
+    let (width, height) = (world.width(), world.height());
+    if x < 5 || x > width - 5 || y < 5 || y > height - 5 {
+        return;
+    }
+    for i in x - 1..x + 2 {
+        for j in y - 1..y + 1 {
+            if world.tile(i, j).is_active() {
+                return;
+            }
+        }
+        let support = world.tile(i, y + 1);
+        if !support.is_active()
+            || !solid_in_desert(support.block)
+            || support.slope != 0
+            || is_boulder(support.block)
+        {
+            return;
+        }
+    }
+    let base = 54 * style;
+    for column in x - 1..x + 2 {
+        let offset = (column - (x - 1)) * 18;
+        for (row, frame_y) in [(y - 1, 0), (y, 18)] {
+            let mut t = world.tile(column, row);
+            t.block = block;
+            t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
+            t.frame_x = (base + offset) as i16;
+            t.frame_y = frame_y as i16;
+            world.set_tile(column, row, t);
+        }
+    }
+}
+
+/// `TileID.Sets.Boulders` (`TileID.cs:195`): the floor these speleothem placements refuse.
+fn is_boulder(block: u16) -> bool {
+    matches!(
+        block,
+        138 | 484 | 664 | 665 | 711 | 712 | 713 | 714 | 715 | 716
+    )
+}
+
+/// `WorldGen.PlaceTight` (`WorldGen.cs:38704-38725`) plus the one arm of
+/// `PlaceUncheckedStalactite` (`:38727+`) that this call site can reach. Returns the draws taken.
+///
+/// `PlaceTight` first refuses a shimmering cell or a live 231, and only then evaluates its
+/// arguments - so the two draws happen inside that guard, not before it (`:38719-38723`). Inside,
+/// nothing is written unless the cell above is solid and both the target and the cell under it are
+/// empty (`:38732`).
+///
+/// From `AddTileVariance` the target is either the cell *above* a sandstone - and that branch only
+/// runs when `flag` says three rows above are clear, so the cell the stalactite would hang from is
+/// air and nothing can be written - or the cell *below* it, whose above-neighbour is the sandstone
+/// itself. So of the six support arms in the source only `type == 396 || type == 397`
+/// (`:38820-38845`) is reachable here, with frameX `378 + variation * 18`: one cell at frameY 72
+/// when the small variant is rolled, two cells at 0 and 18 otherwise. The other arms belong to
+/// materials this loop never stands on, and are absent deliberately rather than guessed at.
+fn place_tight(world: &mut World, rand: &mut UnifiedRandom, column: i32, row: i32) -> usize {
+    let target = world.tile(column, row);
+    if target.is_active() && target.block == 231 {
+        return 0;
+    }
+    let prefer_small = rand.next_max(2) == 0;
+    let variation = rand.next_max(3);
+    let above = world.tile(column, row - 1);
+    let hangs_from_solid_ground = above.is_active()
+        && tile_solid::solid(above.block)
+        && above.slope == 0
+        && !tile_solid::solid_top(above.block);
+    if !hangs_from_solid_ground || target.is_active() || world.tile(column, row + 1).is_active() {
+        return 2;
+    }
+    if above.block != SANDSTONE && above.block != HARDENED_SAND {
+        return 2;
+    }
+    let base = (378 + variation * 18) as i16;
+    let mut head = target;
+    head.block = STALACTITE;
+    head.flags = TileFlags(head.flags.0 | TileFlags::ACTIVE);
+    head.frame_x = base;
+    head.frame_y = if prefer_small { 72 } else { 0 };
+    world.set_tile(column, row, head);
+    if !prefer_small {
+        let mut foot = world.tile(column, row + 1);
+        foot.block = STALACTITE;
+        foot.flags = TileFlags(foot.flags.0 | TileFlags::ACTIVE);
+        foot.frame_x = base;
+        foot.frame_y = 18;
+        world.set_tile(column, row + 1, foot);
+    }
+    2
+}
+
+/// The tile `PlaceUncheckedStalactite` writes: `ushort type = 165` (`WorldGen.cs:38729`).
+const STALACTITE: u16 = 165;
+
+/// `DesertHive.AddTileVariance` (`DesertHive.cs:420-506`), the second loop.
+///
+/// Sandstone that has air above it (`clear_above`) or below it (`clear_below`) rolls for a
+/// decoration. This loop is where the desert's remaining draw gap lives: adding it moved the pass
+/// from 213,796 to 239,052 numbers against the reference's 237,989 on seed 12345.
+///
+/// The overshoot is not a wrong chain, it is a missing write. Vanilla's `PlaceTile` leaves a
+/// 2x2/3x2/stalactite in the cells this same scan reads as open air, so once a decoration lands,
+/// its neighbours stop looking clear and stop rolling. Until the writes are modelled, this scan
+/// sees too much air and rolls about a thousand times too often. The rolls
+/// themselves are taken before any placement test, so they happen whether or not the decoration
+/// fits; only the 165 branch draws inside the placement, as noted below.
+///
+/// The chains, exactly as `:481-502` reads:
+///
+/// 1. `flag` and `Next(20)` hits: `Next(4)` for a style and `Next(30)` for the variant, then a
+///    `PlaceTile` of 751 (style 0) or 485 (that style).
+/// 2. otherwise `flag` and `Next(5)` hits: a 484 at the cell above.
+/// 3. otherwise `flag ^ flag2` and `Next(5)` hits: a 165 stalactite, which is the only placement
+///    of the five that draws: `PlaceTight` rolls `Next(2)` and `Next(3)` for the size and the
+///    variation (`WorldGen.cs:38704-38723`), and that is why the branch costs three draws.
+/// 4. otherwise `flag` and `Next(5)` hits: an 187 whose style is `29 + Next(6)`, so the sixth
+///    draw is taken only when the fifth hit.
+///
+/// Note the third branch's target: `num4 + (!flag ? 1 : -1)`. Reaching it with `flag` true means
+/// branch 2 rolled and missed, so the offset is -1; with `flag` false the XOR requires `flag2`
+/// true, and the offset is +1.
+fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
+    // `k` is the column offset and runs to `Hive.Width + 20`; `l` is the row offset and runs to
+    // `Hive.Height + 20` (`DesertHive.cs:440-443`).
+    for k in -20..hive.width + 20 {
+        for l in -20..hive.height + 20 {
+            let column = k + hive.x;
+            let row = l + hive.y;
+            // `WorldGen.InWorld(num3, num4, 5)`: at least five tiles from every edge, low bound
+            // inclusive (`WorldGen.cs:9642-9649`).
+            if column < 5 || column >= world.width() - 5 || row < 5 || row >= world.height() - 5 {
+                continue;
+            }
+            let tile = world.tile(column, row);
+            if !tile.is_active() || tile.block != SANDSTONE {
+                continue;
+            }
+            // Three rows above, both this column and the next: `flag` is true only if all six are
+            // empty, and vanilla breaks out of the scan at the first solid one.
+            let mut clear_above = true;
+            for offset in [-1, -2, -3] {
+                if world.tile(column, row + offset).is_active()
+                    || world.tile(column + 1, row + offset).is_active()
+                {
+                    clear_above = false;
+                    break;
+                }
+            }
+            let mut clear_below = true;
+            for offset in [1, 2, 3] {
+                if world.tile(column, row + offset).is_active()
+                    || world.tile(column + 1, row + offset).is_active()
+                {
+                    clear_below = false;
+                    break;
+                }
+            }
+            // `remixWorldGen && row > Main.rockLayer` would `continue` here; on an ordinary seed
+            // the first operand is false and the whole test is dead.
+            if clear_above && rand.next_max(20) == 0 {
+                let style = rand.next_max(4);
+                let replacement = rand.next_max(30);
+                if replacement == 0 {
+                    place_2x2(world, column, row - 1, 751, 0);
+                } else {
+                    // 485 goes through `PlaceObject` (`WorldGen.cs:51883`), which writes inactive
+                    // framed cells, so it neither occupies a cell this scan tests as open air nor
+                    // presents a 396 to the `type != 396` test. The draw is right either way; the
+                    // object itself is not written yet.
+                    let _ = style;
+                }
+            } else if clear_above && rand.next_max(5) == 0 {
+                place_2x2(world, column, row - 1, 484, 0);
+            } else if (clear_above ^ clear_below) && rand.next_max(5) == 0 {
+                let target = if clear_above { row - 1 } else { row + 1 };
+                let _ = place_tight(world, rand, column, target);
+            } else if clear_above && rand.next_max(5) == 0 {
+                let style = 29 + rand.next_max(6);
+                place_3x2(world, column, row - 1, 187, style);
+            }
+        }
+    }
+}
+
+/// `DesertBiome.CleanupArea` (`DesertBiome.cs:55-71`).
+///
+/// The rectangle is the hive grown twenty tiles on each side, and the only cost in it is wall
+/// framing: `SquareWallFrame` rolls for the cell itself (`WorldGen.cs:81485-81496`), while
+/// `WorldUtils.TileFrame(i, j, frameNeighbors: true)` is five `WorldGen.TileFrame` calls that
+/// cannot draw during generation because their cosmetic path is guarded by `!generatingWorld`
+/// (`WorldGen.cs:82667`, `WorldUtils.cs:79-89`).
+fn cleanup_area(world: &mut World, rand: &mut UnifiedRandom, area: &Rect) {
+    // Vanilla's `i < area.Right + 20` maps straight onto the exclusive `right() + 20`: the game's
+    // `Rectangle.Right` is `X + Width`, which is also why `DesertHive.cs:266` covers exactly
+    // `Width` columns with `i < area.Right`.
+    for i in area.x - 20..area.right() + 20 {
+        for j in area.y - 20..area.bottom() + 20 {
+            if i > 0 && i < world.width() - 1 && j > 0 && j < world.height() - 1 {
+                let _ = super::tile_runner::square_wall_frame(&*world, rand, i, j);
+            }
+        }
+    }
+}
+
+/// The pass. `WorldGen.cs:12544-12575`.
+pub fn run(vars: &mut GenVars) {
+    let width = vars.world.width();
+    // `Main.maxTilesX / 2`, and the offset is measured from it away from the dungeon.
+    let half = width / 2;
+    let mut side = match vars.dungeon_side {
+        DungeonSide::Left => -1,
+        DungeonSide::Right => 1,
+    };
+    let mut offset = vars.rand.next_max(half) / 8;
+    offset += half / 8;
+    let mut x = half + offset * -side;
+    let origin_y = vars.world_surface_high as i32 + 25;
+    let seed = u64::try_from(vars.seed).unwrap_or(0);
+
+    // The retry loop is the pass: `Place` fails only when the site's floor row runs through jungle
+    // or ice, and every failure costs two draws. `num5` counts failures toward a flip of the
+    // dungeon side (`width / 4` of them), and two flips give up and set `skipDesertTileCheck`,
+    // after which every site is accepted whatever is under it.
+    let mut failures = 0;
+    let mut flips = 0;
+    loop {
+        let skip = vars.skip_desert_tile_check;
+        let placed = {
+            let world = &mut vars.world;
+            let structures = &mut vars.structures;
+            let rand = &mut vars.rand;
+            place(world, structures, rand, seed, (x, origin_y), skip).map(|d| {
+                (
+                    d.combined.inflated(10),
+                    d.hive,
+                    d.desert.y,
+                    d.combined.bottom(),
+                )
+            })
+        };
+        let Some((location, hive, _, _)) = placed else {
+            offset = vars.rand.next_max(half) / 2;
+            offset += half / 8;
+            offset += vars.rand.next_max(failures / 12);
+            x = half + offset * -side;
+            failures += 1;
+            if failures > width / 4 {
+                side = -side;
+                failures = 0;
+                flips += 1;
+                if flips >= 2 {
+                    vars.skip_desert_tile_check = true;
+                }
+            }
+            continue;
+        };
+        // `ExportDescriptionToEngine` (`DesertBiome.cs:50-52`): the location field is assigned and
+        // then inflated in place, so what later passes read is the ten-tile-grown combined area,
+        // while the hive is stored as it was.
+        vars.underground_desert_location = Some(location);
+        vars.underground_desert_hive_location = Some(hive);
+        break;
+    }
 }
 
 /// The desert is placed once, over the layout's own desert band.
@@ -1025,12 +1439,13 @@ pub fn scatter(
     let x = layout.desert.from + layout.desert.width() / 2;
     place(
         world,
-        layout,
         structures,
         rand,
         world_seed,
         (x, layout.surface),
+        false,
     )
+    .map(|d| d.combined.inflated(10))
 }
 
 #[cfg(test)]
@@ -1066,6 +1481,84 @@ mod tests {
         let mut c = FastRandom::new(1234).with_xy(7, 9);
         let mut d = FastRandom::new(1234).with_xy(7, 9);
         assert_eq!(c.next(1000), d.next(1000));
+    }
+
+    /// `AddTileVariance`'s third branch hangs a stalactite under the sandstone it is standing on,
+    /// and on the reference world that is 1,570 cells. A desert that writes none of them is missing
+    /// a material the later passes and the save file both see.
+    #[test]
+    fn the_hive_hangs_stalactites_under_its_sandstone() {
+        let mut world = sandy(1600, 900);
+        let layout = layout_for(&world);
+        let mut structures = StructureMap::new();
+        let mut rand = UnifiedRandom::new(31415);
+        scatter(&mut world, &layout, &mut structures, &mut rand, 999)
+            .expect("the desert was refused");
+        let mut spikes = 0;
+        for x in 300..900 {
+            for y in 120..700 {
+                let t = world.tile(x, y);
+                if t.is_active() && t.block == STALACTITE {
+                    spikes += 1;
+                }
+            }
+        }
+        assert!(spikes > 100, "the desert hung no stalactites: {spikes}");
+    }
+
+    /// The field's sand-versus-hardened-sand speckle is one `FastRandom` advanced once per cell
+    /// (`DesertHive.cs:280`). Copying the base instance inside the loop made every cell read the
+    /// same value, so the desert came out a single colour and the surface pass then hardened about
+    /// thirty thousand cells vanilla leaves as sand. Both materials must appear.
+    #[test]
+    fn the_hive_speckles_sand_and_hardened_sand_together() {
+        let mut world = sandy(1600, 900);
+        let layout = layout_for(&world);
+        let mut structures = StructureMap::new();
+        let mut rand = UnifiedRandom::new(31415);
+        scatter(&mut world, &layout, &mut structures, &mut rand, 999)
+            .expect("the desert was refused");
+        let (mut sand, mut hardened) = (0u32, 0u32);
+        for x in 300..900 {
+            for y in 120..700 {
+                let t = world.tile(x, y);
+                if !t.is_active() {
+                    continue;
+                }
+                if t.block == SAND {
+                    sand += 1;
+                } else if t.block == HARDENED_SAND {
+                    hardened += 1;
+                }
+            }
+        }
+        assert!(sand > 100, "the field wrote no sand: {sand}");
+        assert!(
+            hardened > 100,
+            "the field wrote no hardened sand: {hardened}"
+        );
+        // The share is the discriminator: a per-cell copy that restarts the stream writes one
+        // material everywhere, so the share would sit at 0 or 1.
+        let total = hardened + sand;
+        let share = f64::from(hardened) / f64::from(total);
+        assert!(
+            (0.15..=0.75).contains(&share),
+            "the field's speckle is not a mix: {share} hardened of {total}"
+        );
+    }
+
+    /// One `FastRandom` advances across calls. The field draws `Next(3)` from a single shared
+    /// instance once per cell (`DesertHive.cs:280`), so a copy that restarts each cell is not the
+    /// same stream and paints the desert in one colour.
+    #[test]
+    fn one_fast_random_advances_across_calls() {
+        let mut field = FastRandom::new(999).with_modifier(57005);
+        let first = field.next(3);
+        let rest: Vec<i32> = (0..40).map(|_| field.next(3)).collect();
+        assert!(
+            rest.iter().any(|value| *value != first),
+            "a stream that never varied would colour the whole desert identically"
+        );
     }
 
     #[test]
@@ -1111,9 +1604,8 @@ mod tests {
     fn all_four_entrance_styles_cut_a_way_in() {
         for style in 0..4 {
             let mut world = sandy(1600, 900);
-            let layout = layout_for(&world);
             let mut rand = UnifiedRandom::new(555 + style);
-            let d = describe(&world, &layout, &mut rand, (800, 120))
+            let d = describe(&world, &mut rand, (800, 120), false)
                 .expect("the description should be valid on a clean site");
             let before = solid_count(&world, &d);
             match style {

@@ -173,6 +173,13 @@ pub struct Player {
     /// paths run through `send_section`, which consults this, so a walk back and forth never
     /// resends megabytes of tiles.
     pub sent_sections: HashSet<(i32, i32)>,
+    /// Whether the one-time join tail (existing items and NPCs, then `InitialSpawn`) has gone out.
+    ///
+    /// Separate from [`ConnState::TilesSent`] because a client is allowed to send its spawn packet
+    /// before the section stream has finished, as vanilla allows (`MessageBuffer.cs:901-950`:
+    /// packet 12 advances state 3 to 10 without waiting for the tiles). The state then reads
+    /// `Playing` while the tail is still pending, so it cannot also mean "tail sent".
+    pub join_tail_sent: bool,
     /// Which section this client was last checked against, so the per-tick stream
     /// (`check_player_sections`) does no work at all for a player who has not crossed a section
     /// boundary since the last tick.
@@ -266,6 +273,7 @@ impl Player {
             zone: None,
             open_chest: -1,
             sent_sections: HashSet::new(),
+            join_tail_sent: false,
             last_section: None,
             pending_sections: VecDeque::new(),
             connected_at: std::time::Instant::now(),
