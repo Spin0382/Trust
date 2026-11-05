@@ -1021,6 +1021,106 @@ pub fn place(
     Some(d)
 }
 
+/// `Main.tileSolid[484]`, as this pass sees it: the very first statement of Full Desert sets it
+/// false (`WorldGen.cs:12549`), so a boulder is not a floor for anything placed later in the same
+/// pass. The table otherwise says solid, and the flag persists past the pass (later passes set it
+/// again), so it is modelled here rather than in the shared table.
+fn solid_in_desert(block: u16) -> bool {
+    block != 484 && tile_solid::solid(block)
+}
+
+/// `WorldGen.Place2x2` (`WorldGen.cs:51788-51880`) for the two types this loop uses it for, 484
+/// and 751.
+///
+/// The check and the write are not over the same cells, and that is not a mistranslation: vanilla
+/// tests the two-by-two *up and to the left* of the call (`i` in `x-1..x`, `j` in `y-1..y` all
+/// inactive, and `(i, y+1)` solid for the same two columns) and then writes the two-by-two *down
+/// and to the right*: `(x, y)`, `(x+1, y)`, `(x, y+1)`, `(x+1, y+1)`. `AddTileVariance` calls this
+/// at the cell above the sandstone, so the write lands half on the sandstone that was the support,
+/// which is exactly why a decorated cell stops looking like open air to the next iteration.
+///
+/// `Main.tileTable` would widen what counts as support and is not consulted: nothing the desert
+/// writes is a table. `SolidTile2`'s half-brick and actuator tests (`WorldGen.cs:70683`) are inert
+/// for the same kind of reason: this generator writes neither during generation, so only `slope`
+/// is tested and it is always zero here.
+fn place_2x2(world: &mut World, x: i32, y: i32, block: u16, style: i32) {
+    let (width, height) = (world.width(), world.height());
+    if x < 5 || x > width - 5 || y < 5 || y > height - 5 {
+        return;
+    }
+    for i in x - 1..x {
+        for j in y - 1..y {
+            if world.tile(i, j).is_active() {
+                return;
+            }
+        }
+        let support = world.tile(i, y + 1);
+        if !support.is_active() || !solid_in_desert(support.block) || support.slope != 0 {
+            return;
+        }
+    }
+    for k in 0..2 {
+        for l in 0..2 {
+            let mut t = world.tile(x + k, y + l);
+            t.block = block;
+            t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
+            t.frame_x = (k * 18) as i16;
+            t.frame_y = (style * 36 + l * 18) as i16;
+            world.set_tile(x + k, y + l, t);
+        }
+    }
+}
+
+/// `WorldGen.Place3x2` (`WorldGen.cs:52533-52660`) for type 187, the hanging sandstone brick.
+///
+/// `flag`, the single-row variant, belongs to type 14 style 25 and cannot hold here, so this is the
+/// two-row branch: three columns `x-1..x+2` by two rows `y-1..y+1` must all be inactive and the row
+/// under them must be solid, and for 186/187 that floor may not be a boulder
+/// (`InvalidTileForPilesOrSpeleothems`, `WorldGen.cs:39380-39394`) - which is why a 484 dropped by
+/// the second branch of the caller stops an 187 from landing next to it. Six cells are then
+/// written, the upper row with `frameY` 0 and the lower with 18.
+fn place_3x2(world: &mut World, x: i32, y: i32, block: u16, style: i32) {
+    let (width, height) = (world.width(), world.height());
+    if x < 5 || x > width - 5 || y < 5 || y > height - 5 {
+        return;
+    }
+    for i in x - 1..x + 2 {
+        for j in y - 1..y + 1 {
+            if world.tile(i, j).is_active() {
+                return;
+            }
+        }
+        let support = world.tile(i, y + 1);
+        if !support.is_active()
+            || !solid_in_desert(support.block)
+            || support.slope != 0
+            || is_boulder(support.block)
+        {
+            return;
+        }
+    }
+    let base = 54 * style;
+    for column in x - 1..x + 2 {
+        let offset = (column - (x - 1)) * 18;
+        for (row, frame_y) in [(y - 1, 0), (y, 18)] {
+            let mut t = world.tile(column, row);
+            t.block = block;
+            t.flags = TileFlags(t.flags.0 | TileFlags::ACTIVE);
+            t.frame_x = (base + offset) as i16;
+            t.frame_y = frame_y as i16;
+            world.set_tile(column, row, t);
+        }
+    }
+}
+
+/// `TileID.Sets.Boulders` (`TileID.cs:195`): the floor these speleothem placements refuse.
+fn is_boulder(block: u16) -> bool {
+    matches!(
+        block,
+        138 | 484 | 664 | 665 | 711 | 712 | 713 | 714 | 715 | 716
+    )
+}
+
 /// `DesertHive.AddTileVariance` (`DesertHive.cs:420-506`), the second loop.
 ///
 /// Sandstone that has air above it (`clear_above`) or below it (`clear_below`) rolls for a
@@ -1089,11 +1189,17 @@ fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
             if clear_above && rand.next_max(20) == 0 {
                 let style = rand.next_max(4);
                 let replacement = rand.next_max(30);
-                // 751 replaces 485 when that second roll hits, and 485 is an object placement this
-                // generator does not site yet. Both are counted and disclosed below.
-                let _ = (style, replacement);
+                if replacement == 0 {
+                    place_2x2(world, column, row - 1, 751, 0);
+                } else {
+                    // 485 goes through `PlaceObject` (`WorldGen.cs:51883`), which writes inactive
+                    // framed cells, so it neither occupies a cell this scan tests as open air nor
+                    // presents a 396 to the `type != 396` test. The draw is right either way; the
+                    // object itself is not written yet.
+                    let _ = style;
+                }
             } else if clear_above && rand.next_max(5) == 0 {
-                let _ = 484;
+                place_2x2(world, column, row - 1, 484, 0);
             } else if (clear_above ^ clear_below) && rand.next_max(5) == 0 {
                 let target = if clear_above { row - 1 } else { row + 1 };
                 // `PlaceTight`: the guard at `WorldGen.cs:38719` is a shimmer and a 231 test, and
@@ -1104,7 +1210,7 @@ fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
                 }
             } else if clear_above && rand.next_max(5) == 0 {
                 let style = 29 + rand.next_max(6);
-                let _ = style;
+                place_3x2(world, column, row - 1, 187, style);
             }
         }
     }
