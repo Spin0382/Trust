@@ -1006,6 +1006,28 @@ fn pit_entrance(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
 }
 
 /// `DesertBiome.Place` (`:13-44`). Returns the area it claimed.
+///
+/// Where the pass's 237,989 draws go, measured on the reference world by snapshotting the
+/// generator around every stage (the same breakdown is worth remeasuring if a stage changes):
+///
+/// | stage | draws |
+/// |---|---|
+/// | siting, one attempt | 1 |
+/// | `describe` | 2 |
+/// | `sand_mound` | 23,339 |
+/// | entrance gate and body | 1 |
+/// | `clusters` | 29,780 |
+/// | `place_clusters` | 0 |
+/// | `add_tile_variance` | 22,731 |
+/// | `cleanup_area` | 160,679 |
+///
+/// Three things follow from that table and are worth knowing before debugging it. The mound's
+/// deterministic part is only 443 draws (`desert.Width + 10` columns, of which 113 take a second
+/// roll because `i % 3 == 0`): the other 22,896 are `SquareWallFrame` per sand column tile, which
+/// draws because underground cells carry a cave wall under the sand. `place_clusters` is entirely
+/// `FastRandom` (`DesertHive.cs:260`), so it cannot move the reference stream by even one number.
+/// And the entrance gate failed on this seed, which is why it costs one draw, so nothing about
+/// `ChambersEntrance`'s 50-step spline or `Blotches` explains this pass's draw count.
 pub fn place(
     world: &mut World,
     structures: &mut StructureMap,
