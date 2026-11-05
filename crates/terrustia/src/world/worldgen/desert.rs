@@ -1010,6 +1010,7 @@ pub fn place(
     let groups = clusters(&d, rand);
     place_clusters(world, &d, &groups, rand, world_seed);
     tile_variance(world, &d);
+    add_tile_variance(world, rand, &d.hive);
     cleanup_area(world, rand, &d.hive);
 
     // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20`, not that minus
@@ -1018,6 +1019,95 @@ pub fn place(
     let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 20);
     structures.add_structure(area, 10);
     Some(d)
+}
+
+/// `DesertHive.AddTileVariance` (`DesertHive.cs:420-506`), the second loop.
+///
+/// Sandstone that has air above it (`clear_above`) or below it (`clear_below`) rolls for a
+/// decoration. This loop is where the desert's remaining draw gap lives: adding it moved the pass
+/// from 213,796 to 239,052 numbers against the reference's 237,989 on seed 12345.
+///
+/// The overshoot is not a wrong chain, it is a missing write. Vanilla's `PlaceTile` leaves a
+/// 2x2/3x2/stalactite in the cells this same scan reads as open air, so once a decoration lands,
+/// its neighbours stop looking clear and stop rolling. Until the writes are modelled, this scan
+/// sees too much air and rolls about a thousand times too often. The rolls
+/// themselves are taken before any placement test, so they happen whether or not the decoration
+/// fits; only the 165 branch draws inside the placement, as noted below.
+///
+/// The chains, exactly as `:481-502` reads:
+///
+/// 1. `flag` and `Next(20)` hits: `Next(4)` for a style and `Next(30)` for the variant, then a
+///    `PlaceTile` of 751 (style 0) or 485 (that style).
+/// 2. otherwise `flag` and `Next(5)` hits: a 484 at the cell above.
+/// 3. otherwise `flag ^ flag2` and `Next(5)` hits: a 165 stalactite, which is the only placement
+///    of the five that draws: `PlaceTight` rolls `Next(2)` and `Next(3)` for the size and the
+///    variation (`WorldGen.cs:38704-38723`), and that is why the branch costs three draws.
+/// 4. otherwise `flag` and `Next(5)` hits: an 187 whose style is `29 + Next(6)`, so the sixth
+///    draw is taken only when the fifth hit.
+///
+/// Note the third branch's target: `num4 + (!flag ? 1 : -1)`. Reaching it with `flag` true means
+/// branch 2 rolled and missed, so the offset is -1; with `flag` false the XOR requires `flag2`
+/// true, and the offset is +1.
+fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
+    // `k` is the column offset and runs to `Hive.Width + 20`; `l` is the row offset and runs to
+    // `Hive.Height + 20` (`DesertHive.cs:440-443`).
+    for k in -20..hive.width + 20 {
+        for l in -20..hive.height + 20 {
+            let column = k + hive.x;
+            let row = l + hive.y;
+            // `WorldGen.InWorld(num3, num4, 5)`: at least five tiles from every edge, low bound
+            // inclusive (`WorldGen.cs:9642-9649`).
+            if column < 5 || column >= world.width() - 5 || row < 5 || row >= world.height() - 5 {
+                continue;
+            }
+            let tile = world.tile(column, row);
+            if !tile.is_active() || tile.block != SANDSTONE {
+                continue;
+            }
+            // Three rows above, both this column and the next: `flag` is true only if all six are
+            // empty, and vanilla breaks out of the scan at the first solid one.
+            let mut clear_above = true;
+            for offset in [-1, -2, -3] {
+                if world.tile(column, row + offset).is_active()
+                    || world.tile(column + 1, row + offset).is_active()
+                {
+                    clear_above = false;
+                    break;
+                }
+            }
+            let mut clear_below = true;
+            for offset in [1, 2, 3] {
+                if world.tile(column, row + offset).is_active()
+                    || world.tile(column + 1, row + offset).is_active()
+                {
+                    clear_below = false;
+                    break;
+                }
+            }
+            // `remixWorldGen && row > Main.rockLayer` would `continue` here; on an ordinary seed
+            // the first operand is false and the whole test is dead.
+            if clear_above && rand.next_max(20) == 0 {
+                let style = rand.next_max(4);
+                let replacement = rand.next_max(30);
+                // 751 replaces 485 when that second roll hits, and 485 is an object placement this
+                // generator does not site yet. Both are counted and disclosed below.
+                let _ = (style, replacement);
+            } else if clear_above && rand.next_max(5) == 0 {
+                let _ = 484;
+            } else if (clear_above ^ clear_below) && rand.next_max(5) == 0 {
+                let target = if clear_above { row - 1 } else { row + 1 };
+                // `PlaceTight`: the guard at `WorldGen.cs:38719` is a shimmer and a 231 test, and
+                // neither can hold of a cell the scan above just found empty, so both draws happen.
+                if !world.tile(column, target).is_active() {
+                    let _ = rand.next_max(2);
+                    let _ = rand.next_max(3);
+                }
+            } else if clear_above && rand.next_max(5) == 0 {
+                let style = 29 + rand.next_max(6);
+                let _ = style;
+            }
+        }
+    }
 }
 
 /// `DesertBiome.CleanupArea` (`DesertBiome.cs:55-71`).
