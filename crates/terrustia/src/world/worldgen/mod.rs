@@ -1866,12 +1866,26 @@ mod tests {
     /// worldgen passes drain liquid without resetting the type byte, matching vanilla's own
     /// `Tile.liquidType`, which is not reset on drain either); that byte alone differing, with
     /// both sides genuinely dry, is not a real difference a save lost.
+    /// A second, same-shaped exemption: `frameX`/`frameY` on a tile type that is not frame
+    /// important. The format only carries frames for framed types, in this writer and in vanilla's
+    /// own (`section.rs` gates both directions on `tile_sets::frame_important`), and marble is one
+    /// of the many ids that is not framed: `Main.cs` gives 367 `tileSolid`, `tileBlockLight`,
+    /// `tileMergeDirt` and `npcCatchable` and never sets `tileFrameImportant` for it, among the 405
+    /// ids that do. Several generator paths stamp frames onto such tiles because they build the
+    /// tile as a 2x2 or 3x2 unit; the in-memory world keeps them, exactly as vanilla's does, and
+    /// the file has nowhere to put them. That is a format limit, not a save losing something.
     fn tiles_equal_for_save(before: Tile, after: Tile) -> bool {
         before == after
             || (before.liquid == 0
                 && after.liquid == 0
                 && Tile {
                     liquid_kind: after.liquid_kind,
+                    ..before
+                } == after)
+            || (!terrustia_proto::tile_sets::frame_important(before.block)
+                && Tile {
+                    frame_x: after.frame_x,
+                    frame_y: after.frame_y,
                     ..before
                 } == after)
     }
