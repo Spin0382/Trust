@@ -43,6 +43,7 @@ use terrustia_proto::{Liquid, Tile, TileFlags, tile_solid};
 
 use super::genpipe::{Action, Ctx, Link, Shape, chain, gen_shape, gen_shape_out};
 use super::layout::Layout;
+use super::passes::{DungeonSide, GenVars};
 use super::rand::UnifiedRandom;
 use super::structure_map::{Rect, StructureMap};
 use crate::world::World;
@@ -192,33 +193,36 @@ fn surface_map(world: &World, start_x: i32, width: i32) -> (Vec<i32>, f64, i32) 
     (heights, average, bottom)
 }
 
-/// `DesertDescription.CreateFromPlacement` (`:54-91`). `None` where vanilla returns `Invalid`.
+/// `DesertDescription.CreateFromPlacement` (`:43-84`). `None` where vanilla returns `Invalid`.
 pub fn describe(
     world: &World,
-    layout: &Layout,
     rand: &mut UnifiedRandom,
     origin: (i32, i32),
+    skip_tile_check: bool,
 ) -> Option<Description> {
-    let scale = f64::from(layout.width) / 4200.0;
+    let scale = f64::from(world.width()) / 4200.0;
     let columns = (80.0 * scale) as i32;
     let rows = ((rand.next_double() * 0.5 + 1.5) * 170.0 * scale) as i32;
     let width = (BLOCK_SCALE.0 * f64::from(columns)) as i32;
     let height = (BLOCK_SCALE.1 * f64::from(rows)) as i32;
-    if width < 10 || height < 10 {
-        return None;
-    }
     let x = origin.0 - width / 2;
 
     let (heights, average, bottom) = surface_map(world, x - 5, width + 10);
-    // Refuse a site whose floor row runs through jungle, snow or ice.
-    for i in x..x + width {
-        let t = world.tile(i, bottom).block;
-        if matches!(t, 59 | 60 | 161 | 147) {
-            return None;
+    // `DesertDescription.Cleanup` is `RowHasInvalidTiles`, and `skipDesertTileCheck` short-circuits
+    // it before the scan (`DesertDescription.cs:88`): once the desert has failed twice into a
+    // flip of the dungeon side, every later site is accepted whatever runs through its floor row.
+    if !skip_tile_check {
+        for i in x..x + width {
+            let t = world.tile(i, bottom).block;
+            if matches!(t, 59 | 60 | 161 | 147) {
+                return None;
+            }
         }
     }
 
-    let top = (average as i32 + bottom) / 2;
+    // Vanilla is `(int)(Average + (double)Bottom) / 2`: the cast binds before the divide, so the
+    // sum is truncated once and then divided as integers.
+    let top = (average + f64::from(bottom)) as i32 / 2;
     let y = top + rand.next_range(40, 60);
     Some(Description {
         combined: Rect::new(x, top, width, y + height - top),
@@ -277,6 +281,12 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
             t.liquid = 0;
             reset_to_type(&mut t, SAND);
             world.set_tile(i + d.desert.x, j, t);
+            // `SandMound.PlaceSandColumn` ends every tile of the column with
+            // `SquareWallFrame(startX, num2)` (`SandMound.cs:73`). Most of the time that is free,
+            // because the cell has no wall yet: `WallFrame` returns at `Framing.cs:346-351`. It is
+            // not free where the surface already carried a wall, and it is one of the terms the
+            // desert's draw total is made of.
+            let _ = super::tile_runner::square_wall_frame(&*world, rand, i + d.desert.x, j);
         }
     }
 }
@@ -963,13 +973,13 @@ fn pit_entrance(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
 /// `DesertBiome.Place` (`:13-44`). Returns the area it claimed.
 pub fn place(
     world: &mut World,
-    layout: &Layout,
     structures: &mut StructureMap,
     rand: &mut UnifiedRandom,
     world_seed: u64,
     origin: (i32, i32),
-) -> Option<Rect> {
-    let mut d = describe(world, layout, rand, origin)?;
+    skip_tile_check: bool,
+) -> Option<Description> {
+    let mut d = describe(world, rand, origin, skip_tile_check)?;
     sand_mound(world, &d, rand);
     let (heights, _, _) = surface_map(world, d.combined.x - 5, d.combined.width + 10);
     d.surface = heights;
@@ -1000,15 +1010,94 @@ pub fn place(
     let groups = clusters(&d, rand);
     place_clusters(world, &d, &groups, rand, world_seed);
     tile_variance(world, &d);
+    cleanup_area(world, rand, &d.hive);
 
-    let area = Rect::new(
-        d.combined.x,
-        50,
-        d.combined.width,
-        (d.combined.bottom() - 20 - 50).max(1),
-    );
+    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20`, not that minus
+    // the `50` the rectangle starts at. The recorded area is therefore taller than the desert, and
+    // every later `CanPlace` test inside it is refused for rows that have no sand in them.
+    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 20);
     structures.add_structure(area, 10);
-    Some(d.combined.inflated(10))
+    Some(d)
+}
+
+/// `DesertBiome.CleanupArea` (`DesertBiome.cs:55-71`).
+///
+/// The rectangle is the hive grown twenty tiles on each side, and the only cost in it is wall
+/// framing: `SquareWallFrame` rolls for the cell itself (`WorldGen.cs:81485-81496`), while
+/// `WorldUtils.TileFrame(i, j, frameNeighbors: true)` is five `WorldGen.TileFrame` calls that
+/// cannot draw during generation because their cosmetic path is guarded by `!generatingWorld`
+/// (`WorldGen.cs:82667`, `WorldUtils.cs:79-89`).
+fn cleanup_area(world: &mut World, rand: &mut UnifiedRandom, area: &Rect) {
+    // `.NET Rectangle.Right` is `X + Width - 1`, so vanilla's `i < area.Right + 20` stops one
+    // column before our exclusive `right() + 20`.
+    for i in area.x - 20..area.right() + 19 {
+        for j in area.y - 20..area.bottom() + 19 {
+            if i > 0 && i < world.width() - 1 && j > 0 && j < world.height() - 1 {
+                let _ = super::tile_runner::square_wall_frame(&*world, rand, i, j);
+            }
+        }
+    }
+}
+
+/// The pass. `WorldGen.cs:12544-12575`.
+pub fn run(vars: &mut GenVars) {
+    let width = vars.world.width();
+    // `Main.maxTilesX / 2`, and the offset is measured from it away from the dungeon.
+    let half = width / 2;
+    let mut side = match vars.dungeon_side {
+        DungeonSide::Left => -1,
+        DungeonSide::Right => 1,
+    };
+    let mut offset = vars.rand.next_max(half) / 8;
+    offset += half / 8;
+    let mut x = half + offset * -side;
+    let origin_y = vars.world_surface_high as i32 + 25;
+    let seed = u64::try_from(vars.seed).unwrap_or(0);
+
+    // The retry loop is the pass: `Place` fails only when the site's floor row runs through jungle
+    // or ice, and every failure costs two draws. `num5` counts failures toward a flip of the
+    // dungeon side (`width / 4` of them), and two flips give up and set `skipDesertTileCheck`,
+    // after which every site is accepted whatever is under it.
+    let mut failures = 0;
+    let mut flips = 0;
+    loop {
+        let skip = vars.skip_desert_tile_check;
+        let placed = {
+            let world = &mut vars.world;
+            let structures = &mut vars.structures;
+            let rand = &mut vars.rand;
+            place(world, structures, rand, seed, (x, origin_y), skip).map(|d| {
+                (
+                    d.combined.inflated(10),
+                    d.hive,
+                    d.desert.y,
+                    d.combined.bottom(),
+                )
+            })
+        };
+        let Some((location, hive, _, _)) = placed else {
+            offset = vars.rand.next_max(half) / 2;
+            offset += half / 8;
+            offset += vars.rand.next_max(failures / 12);
+            x = half + offset * -side;
+            failures += 1;
+            if failures > width / 4 {
+                side = -side;
+                failures = 0;
+                flips += 1;
+                if flips >= 2 {
+                    vars.skip_desert_tile_check = true;
+                }
+            }
+            continue;
+        };
+        // `ExportDescriptionToEngine` (`DesertBiome.cs:50-52`): the location field is assigned and
+        // then inflated in place, so what later passes read is the ten-tile-grown combined area,
+        // while the hive is stored as it was.
+        vars.underground_desert_location = Some(location);
+        vars.underground_desert_hive_location = Some(hive);
+        break;
+    }
 }
 
 /// The desert is placed once, over the layout's own desert band.
@@ -1025,12 +1114,13 @@ pub fn scatter(
     let x = layout.desert.from + layout.desert.width() / 2;
     place(
         world,
-        layout,
         structures,
         rand,
         world_seed,
         (x, layout.surface),
+        false,
     )
+    .map(|d| d.combined.inflated(10))
 }
 
 #[cfg(test)]
@@ -1111,9 +1201,8 @@ mod tests {
     fn all_four_entrance_styles_cut_a_way_in() {
         for style in 0..4 {
             let mut world = sandy(1600, 900);
-            let layout = layout_for(&world);
             let mut rand = UnifiedRandom::new(555 + style);
-            let d = describe(&world, &layout, &mut rand, (800, 120))
+            let d = describe(&world, &mut rand, (800, 120), false)
                 .expect("the description should be valid on a clean site");
             let before = solid_count(&world, &d);
             match style {

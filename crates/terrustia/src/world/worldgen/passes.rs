@@ -130,12 +130,28 @@ pub struct GenVars {
     /// `GenVars.snowTop` and `GenVars.snowBottom`: the first and last rows the ice biome reached.
     pub snow_top: i32,
     pub snow_bottom: i32,
+    /// `GenVars.skipDesertTileCheck`: set when the desert could not find a site and gave up
+    /// (`WorldGen.cs:12569-12571`), read by the site check itself (`DesertDescription.cs:88`) and
+    /// reset per world (`WorldGen.cs:11252`).
+    pub skip_desert_tile_check: bool,
+    /// `GenVars.UndergroundDesertLocation`: the desert's combined area inflated ten each way
+    /// (`DesertBiome.cs:50`), read by everything later that calls the desert a place.
+    pub underground_desert_location: Option<super::structure_map::Rect>,
+    /// `GenVars.UndergroundDesertHiveLocation`: the hive, stored un-inflated (`DesertBiome.cs:51`).
+    pub underground_desert_hive_location: Option<super::structure_map::Rect>,
+    /// `GenVars.desertHiveHigh/Low/Left/Right`: the hive's tile bounds, rows and columns
+    /// respectively (`WorldGen.cs:11016-11034`).
+    pub desert_hive_high: i32,
+    pub desert_hive_low: i32,
+    pub desert_hive_left: i32,
+    pub desert_hive_right: i32,
 }
 
 impl GenVars {
     pub fn new(seed: i32, world: World) -> Self {
         // Read before `world` moves into the struct below.
         let height = world.height();
+        let width = world.width();
         Self {
             rand: UnifiedRandom::new(seed),
             seed,
@@ -199,6 +215,15 @@ impl GenVars {
             snow_max_x: vec![0; height as usize],
             snow_top: 0,
             snow_bottom: 0,
+            skip_desert_tile_check: false,
+            underground_desert_location: None,
+            underground_desert_hive_location: None,
+            // `WorldGen.Reset` seeds the hive bounds so the first real hive tile always wins the
+            // min/max it takes (`WorldGen.cs:11174-11177`).
+            desert_hive_high: height,
+            desert_hive_low: 0,
+            desert_hive_left: width,
+            desert_hive_right: 0,
         }
     }
 }
