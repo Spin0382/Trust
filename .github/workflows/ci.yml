@@ -18,6 +18,7 @@ jobs:
   check:
     name: Format, lints and tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -74,6 +75,9 @@ jobs:
   targets:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # The riscv64 cross-compile once sat for six hours until the runner cancelled it, which is
+    # worse than a timeout: it holds a queue slot and says nothing about the code.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
