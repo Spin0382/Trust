@@ -476,9 +476,11 @@ fn place_clusters(
                 let mut sum = 0.0;
                 for b in cluster {
                     let d2 = (b.0 - at.0).powi(2) + (b.1 - at.1).powi(2);
-                    if d2 > 0.0 {
-                        sum += 1.0 / d2;
-                    }
+                    // Vanilla divides unconditionally (`DesertHive.cs:297`), so a cell that lands
+                    // exactly on a block source takes the infinity and the whole cell becomes an
+                    // open chamber (`num7 > 3.5`). Skipping the zero case here instead quietly
+                    // changes which cells are chambers.
+                    sum += 1.0 / d2;
                 }
                 if sum > best {
                     if best > second {
