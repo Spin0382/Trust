@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The `long` job below only runs here, so a schedule costs nothing on a push.
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -217,3 +221,46 @@ jobs:
       - run: cargo build --release --workspace --bins --examples
       - name: Soak
         run: ./tools/soak_ci.sh
+
+  # The runs a push cannot afford, in one job because they all need the same release build.
+  # Nothing here is new: the fuzz targets have only ever had 60 seconds, and the panel's Playwright
+  # spec has never run anywhere except a developer machine, which is the same mistake class this
+  # file already records once - a check that exists but does not gate. Nightly, and by hand before
+  # a release candidate.
+  long:
+    name: Long fuzz, five minute soak, panel end to end
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # Both toolchains, because `cargo` resolves through the workspace pin while `cargo +nightly`
+      # has to reach the sanitizer build cargo-fuzz needs. The single-toolchain fuzz job above can
+      # afford to install one; a combined job cannot.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Fuzz the decoder for five minutes each
+        run: |
+          cargo +nightly fuzz run section_stream -- -max_total_time=300
+          cargo +nightly fuzz run packet_decoders -- -max_total_time=300
+      - name: Build the web panel frontend
+        working-directory: crates/terrustia/web-panel
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+      - run: cargo build --release --workspace --bins --examples
+      - name: Five minute soak
+        run: ./tools/soak_ci.sh 300
+      - name: Panel end to end
+        working-directory: crates/terrustia/web-panel
+        run: |
+          bunx playwright install --with-deps chromium
+          bunx playwright test
