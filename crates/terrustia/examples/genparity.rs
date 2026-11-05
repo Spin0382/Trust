@@ -417,6 +417,53 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    // `--peek <file>:<column>:<from>:<to>` dumps one column of one world and stops. Aggregates can
+    // say a pass wrote the wrong cells; only a dump says what is standing there. The desert's
+    // whole remaining gap turned on one such question: what tile does the world stopped one pass
+    // earlier hold at column 1657, rows 229 to 261, where our surface scan and vanilla's disagree.
+    if let Some(spec) = arg_after("--peek") {
+        let (file, rest) = match spec.split_once(':') {
+            Some(parts) => parts,
+            None => {
+                eprintln!("--peek wants file:column:from:to");
+                return ExitCode::FAILURE;
+            }
+        };
+        let nums: Vec<Option<i32>> = rest.split(':').map(|text| text.parse().ok()).collect();
+        let [Some(column), Some(from), Some(to)] = nums.as_slice() else {
+            eprintln!("--peek wants file:column:from:to");
+            return ExitCode::FAILURE;
+        };
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("could not read {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let peeked = match wld::parse(&bytes) {
+            Ok(world) => world,
+            Err(e) => {
+                eprintln!("could not parse {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        println!("column {column} of {file}, rows {from}..{to}:");
+        for row in *from..=*to {
+            let tile = peeked.tile(*column, row);
+            println!(
+                "  row {row:>4}: active={:<5} block={:>3} wall={:>3} liquid={:>3} frame=({:>5},{:>5})",
+                tile.is_active(),
+                tile.block,
+                tile.wall,
+                tile.liquid,
+                tile.frame_x,
+                tile.frame_y
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let seed = translate_seed(&world.seed_text);
     // An optional `--save PATH` writes the world the implemented passes actually built. The
     // manifest says whether a pass drew right; only the tiles say why, and a pass that branches on
