@@ -34,12 +34,18 @@
 //!
 //! Deliberately different, both following calls this generator already made:
 //!
-//! * **Framing is dropped.** `SetFrames`, `ClearTile(frameNeighbors)` and `PlaceWall(neighbors)`
-//!   all call into `TileFrame`/`SquareWallFrame`, which are client-side auto-tile repaints; a
-//!   dedicated server never computes them, since a client draws a block's connectivity from its
-//!   neighbours alone. `pyramids.rs` and `tile_cleanup.rs` state the same reasoning for the same
-//!   functions. `SetFrames` is still a real link in a chain, because its other job - recording
-//!   into a `ShapeData` via `Output` - is load-bearing.
+//! * **Block framing is dropped, wall framing is not.** `WorldGen.TileFrame` only reaches its
+//!   cosmetic path, the one that could roll a frame number, when `generatingWorld` is false
+//!   (`WorldGen.cs:82667`), so `SetFrames` and `ClearTile(frameNeighbors)` cost no draws here and a
+//!   dedicated server never computes the picture either: a client derives a block's connectivity
+//!   from its neighbours alone. `pyramids.rs` and `tile_cleanup.rs` state the same reasoning for
+//!   the same functions. Wall framing is different and was wrong here until the desert needed the
+//!   numbers: `Framing.WallFrame` rolls `genRand.Next(0, 3)` for a reset frame
+//!   (`Framing.cs:396-402`), and `Actions.PlaceWall.Apply` squares the cell *and its four
+//!   orthogonal neighbours* (`Actions.cs:536-548`), so a placement costs between one and five draws
+//!   depending on the walls already around it. See [`super::tile_runner::square_wall_frame`].
+//!   `SetFrames` is still a real link in a chain, because its other job - recording into a
+//!   `ShapeData` via `Output` - is load-bearing.
 //! * **Out-of-bounds reads and writes are dropped, not faulted.** Vanilla indexes `Main.tile`
 //!   directly and would throw; `World::tile` returns air outside the world and `World::set_tile`
 //!   returns false, so a shape overhanging the edge trims instead of taking the process down
@@ -372,6 +378,20 @@ fn apply(
                 let mut t = ctx.world.tile(x, y);
                 t.wall = ty;
                 ctx.world.set_tile(x, y, t);
+                // `Actions.PlaceWall.Apply` (`Actions.cs:536-548`) in vanilla's own order: the
+                // cell, then the four orthogonal neighbours (`_neighbors` defaults to true, and no
+                // unit ported here turns it off). Each `SquareWallFrame` can draw for its centre
+                // only, so a placement into an already walled area costs up to five numbers and
+                // one into open air costs one - `PlaceWall(0)` still frames the neighbours, which
+                // is why clearing a wall is not free either.
+                for (column, row) in [(x, y), (x + 1, y), (x - 1, y), (x, y - 1), (x, y + 1)] {
+                    let _ = super::tile_runner::square_wall_frame(
+                        &*ctx.world,
+                        &mut *ctx.rand,
+                        column,
+                        row,
+                    );
+                }
             }
             unit_apply(link, rest, ctx, origin, x, y)
         }
@@ -1076,6 +1096,46 @@ mod tests {
             ctx.rand.next(),
             after_two,
             "one unit of Blotches must consume exactly two draws"
+        );
+    }
+
+    /// `Actions.PlaceWall` frames the cell *and* its four orthogonal neighbours, so a neighbour
+    /// that already holds a small-framed wall costs a draw of its own. This is the term that
+    /// dominates any biome that walls a large area.
+    #[test]
+    fn placing_a_wall_frames_the_neighbours_it_touches() {
+        let mut w = world();
+        let mut east = w.tile(31, 30);
+        east.wall = 187;
+        w.set_tile(31, 30, east);
+
+        let mut r = UnifiedRandom::new(12345);
+        let mut probe = UnifiedRandom::new(12345);
+        // The new wall at the centre, and the one already at (31, 30). The other three neighbours
+        // are bare, and a bare cell returns before the roll (`Framing.cs:346-351`).
+        for _ in 0..2 {
+            let _ = probe.next_range(0, 3);
+        }
+        let after_two = probe.next();
+
+        let mut ctx = Ctx::new(&mut w, &mut r);
+        let mut c = chain([Link::new(Action::PlaceWall(216))]);
+        gen_shape(
+            &mut ctx,
+            (30, 30),
+            &Shape::Rectangle {
+                left: 0,
+                top: 0,
+                width: 1,
+                height: 1,
+            },
+            &mut c,
+        );
+        assert_eq!(ctx.world.tile(30, 30).wall, 216);
+        assert_eq!(
+            ctx.rand.next(),
+            after_two,
+            "a walled neighbour must add exactly one frame roll, no more"
         );
     }
 

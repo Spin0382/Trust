@@ -208,27 +208,73 @@ fn wall_large_frames(wall: u16) -> u8 {
     }
 }
 
-/// The draw `Framing.WallFrame` makes when it re-rolls a wall's frame number
-/// (`Framing.cs:396-402`).
+/// The number of draws `Framing.WallFrame` rolls for one wall (`Framing.cs:385-404`).
 ///
-/// `WorldGen.PlaceWall` finishes with `SquareWallFrame(i, j)` (`WorldGen.cs:75751`), and
-/// `SquareWallFrame` passes its own `resetFrame` only to the centre cell (`WorldGen.cs:81491`);
-/// the eight neighbours keep their frame number and draw nothing. So a placed wall costs one
-/// `Next(0, 3)`, plus `Next(2)` when the wall is 21. Walls 15 and 64 are neither large-framed nor
-/// 21, which is why the jungle's mud branch draws exactly one extra number per wall.
-fn wall_frame_draws(wall: u16) -> u8 {
+/// A large-framed wall takes its number from a position lookup instead of a roll, and wall 21 rolls
+/// twice: once for the frame number and once for its second variant.
+pub(crate) fn wall_frame_draws(wall: u16) -> u8 {
     if wall_large_frames(wall) != 0 {
         return 0;
     }
     if wall == 21 { 2 } else { 1 }
 }
 
+/// `Framing.WallFrame` for one cell (`Framing.cs:334-408`): takes the draws it owes and returns how
+/// many those were.
+///
+/// Three of the four ways in are silent. `resetFrame` false keeps the existing number
+/// (`:405-408`), a wall of 0 returns before the roll (`:346-351`), and a cell on or outside the
+/// one-tile border returns at the guard (`:336`). The frame number itself is not stored: `Tile` has
+/// no field for it and the `.wld` writer derives one, so the draw is all the parity oracle can see.
+///
+/// `WallID.Count` is deliberately not modelled: vanilla zeroes a wall id at or past it, and no pass
+/// ported here places one.
+pub(crate) fn wall_frame(
+    world: &World,
+    rand: &mut UnifiedRandom,
+    column: i32,
+    row: i32,
+    reset_frame: bool,
+) -> usize {
+    if !reset_frame
+        || column <= 0
+        || row <= 0
+        || column >= world.width() - 1
+        || row >= world.height() - 1
+    {
+        return 0;
+    }
+    let wall = world.tile(column, row).wall;
+    if wall == 0 {
+        return 0;
+    }
+    match wall_frame_draws(wall) {
+        0 => 0,
+        1 => {
+            let _ = rand.next_range(0, 3);
+            1
+        }
+        _ => {
+            let _ = rand.next_range(0, 3);
+            let _ = rand.next_max(2);
+            2
+        }
+    }
+}
+
+/// `WorldGen.SquareWallFrame(i, j)` (`WorldGen.cs:81485-81496`). It frames the nine cells of the
+/// square but hands `resetFrame` only to the centre, so the eight neighbours can never draw here.
+pub(crate) fn square_wall_frame(
+    world: &World,
+    rand: &mut UnifiedRandom,
+    column: i32,
+    row: i32,
+) -> usize {
+    wall_frame(world, rand, column, row, true)
+}
+
 /// `WorldGen.PlaceWall` (`WorldGen.cs:75737`): a cell only takes a wall when it has none, and
 /// the two-cell border is never touched.
-///
-/// The wall frame number the frame re-roll produces is not stored yet: `Tile` has no field for
-/// it, and the .wld writer derives one. The draw itself is what the parity oracle sees, so it is
-/// taken here and the frame number discarded.
 fn place_wall(
     world: &mut World,
     rand: &mut UnifiedRandom,
@@ -246,10 +292,7 @@ fn place_wall(
     }
     tile.wall = wall;
     world.set_tile(x, y, tile);
-    for _ in 0..wall_frame_draws(wall) {
-        *draws += 1;
-        let _ = rand.next_max(3);
-    }
+    *draws += square_wall_frame(world, rand, x, y);
 }
 
 /// `TileID.Sets.IsATreeTrunk` (`TileID.cs:161`).
