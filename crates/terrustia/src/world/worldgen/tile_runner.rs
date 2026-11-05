@@ -11,7 +11,11 @@
 //! (`WorldGen.cs:4071`), and `Main.tileCut` (`Main.cs:7503-10389`). `Main.tileFrameImportant` is
 //! the generated `tile_sets::frame_important` table.
 
-use terrustia_proto::tile_sets::frame_important;
+use terrustia_proto::{
+    TileFlags,
+    tile_sets::frame_important,
+    tile_solid::{solid, solid_top},
+};
 
 use super::rand::UnifiedRandom;
 use crate::world::World;
@@ -70,7 +74,7 @@ fn tile_cut(block: u16) -> bool {
 /// `TileID.Sets.CanBeClearedDuringGeneration` (`TileID.cs:321`), a default-true set whose listed
 /// exceptions are the tiles terrain passes must leave alone: sandstone and hardened sand, granite
 /// and marble, dungeon and temple bricks and cracked bricks, and desert fossil.
-fn can_be_cleared(block: u16) -> bool {
+pub(crate) fn can_be_cleared(block: u16) -> bool {
     !matches!(
         block,
         396 | 400
@@ -115,6 +119,7 @@ fn override_skip(
     row: i32,
     ctx: RunnerContext,
     rand: &mut UnifiedRandom,
+    draws: &mut usize,
 ) -> bool {
     let mut skip = tile_stone(runner_type) && tile.block != 1;
     if !can_be_cleared(tile.block) {
@@ -141,10 +146,11 @@ fn override_skip(
         1 => {
             // The draw is inside the test in vanilla too, and `&&` short-circuits it the same way,
             // so a runner that is not mud consumes nothing here.
-            if runner_type == 59
-                && (row as f64) < ctx.world_surface + f64::from(rand.next_range(-50, 50))
-            {
-                skip = true;
+            if runner_type == 59 {
+                *draws += 1;
+                if (row as f64) < ctx.world_surface + f64::from(rand.next_range(-50, 50)) {
+                    skip = true;
+                }
             }
         }
         // Vanilla's `case 367 / case 368` only ever sets the flag, so the type test is an arm guard.
@@ -191,6 +197,164 @@ impl Rect {
     }
 }
 
+/// `Main.wallLargeFrames` (`Main.cs:9882-10038`): the walls whose frame number comes from a
+/// position lookup instead of a random roll. Everything else is 0.
+fn wall_large_frames(wall: u16) -> u8 {
+    match wall {
+        179 | 146 | 147 | 167 | 354 => 1,
+        224 | 323 | 324 | 325 | 326 | 327 | 328 | 329 | 330 | 185 | 274 | 355 | 358 | 359 | 362
+        | 363 | 366 => 2,
+        _ => 0,
+    }
+}
+
+/// The draw `Framing.WallFrame` makes when it re-rolls a wall's frame number
+/// (`Framing.cs:396-402`).
+///
+/// `WorldGen.PlaceWall` finishes with `SquareWallFrame(i, j)` (`WorldGen.cs:75751`), and
+/// `SquareWallFrame` passes its own `resetFrame` only to the centre cell (`WorldGen.cs:81491`);
+/// the eight neighbours keep their frame number and draw nothing. So a placed wall costs one
+/// `Next(0, 3)`, plus `Next(2)` when the wall is 21. Walls 15 and 64 are neither large-framed nor
+/// 21, which is why the jungle's mud branch draws exactly one extra number per wall.
+fn wall_frame_draws(wall: u16) -> u8 {
+    if wall_large_frames(wall) != 0 {
+        return 0;
+    }
+    if wall == 21 { 2 } else { 1 }
+}
+
+/// `WorldGen.PlaceWall` (`WorldGen.cs:75737`): a cell only takes a wall when it has none, and
+/// the two-cell border is never touched.
+///
+/// The wall frame number the frame re-roll produces is not stored yet: `Tile` has no field for
+/// it, and the .wld writer derives one. The draw itself is what the parity oracle sees, so it is
+/// taken here and the frame number discarded.
+fn place_wall(
+    world: &mut World,
+    rand: &mut UnifiedRandom,
+    draws: &mut usize,
+    x: i32,
+    y: i32,
+    wall: u16,
+) {
+    if x <= 1 || y <= 1 || x >= world.width() - 2 || y >= world.height() - 2 {
+        return;
+    }
+    let mut tile = world.tile(x, y);
+    if tile.wall != 0 {
+        return;
+    }
+    tile.wall = wall;
+    world.set_tile(x, y, tile);
+    for _ in 0..wall_frame_draws(wall) {
+        *draws += 1;
+        let _ = rand.next_max(3);
+    }
+}
+
+/// `TileID.Sets.IsATreeTrunk` (`TileID.cs:161`).
+fn is_tree_trunk(block: u16) -> bool {
+    matches!(
+        block,
+        5 | 72 | 583 | 584 | 585 | 586 | 587 | 588 | 589 | 596 | 616 | 634
+    )
+}
+
+/// `TileID.Sets.PreventsTileRemovalIfOnTopOfIt` (`TileID.cs:169`).
+fn prevents_removal_if_on_top(block: u16) -> bool {
+    matches!(
+        block,
+        5 | 323
+            | 72
+            | 488
+            | 26
+            | 583
+            | 584
+            | 585
+            | 586
+            | 587
+            | 588
+            | 589
+            | 596
+            | 616
+            | 470
+            | 475
+            | 634
+    )
+}
+
+/// `WorldGen.IsLockedDoor` (`WorldGen.cs:69727`).
+fn is_locked_door(tile: &terrustia_proto::Tile) -> bool {
+    tile.block == 10 && (594..=646).contains(&tile.frame_y) && tile.frame_x < 54
+}
+
+/// `WorldGen.CheckTileBreakability` (`WorldGen.cs:62882`), as far as generation needs it.
+///
+/// Returns 2 when the tile must not be removed, 0 otherwise. The `1` case (a locked door that
+/// only "fails" to break) and the boulder and door arms cannot arise before the passes that place
+/// them, and the container scan has nothing to find this early.
+fn check_tile_breakability(world: &World, x: i32, y: i32) -> i32 {
+    let tile = world.tile(x, y);
+    if !(1..=world.height() - 1).contains(&y) {
+        return 0;
+    }
+    let above = world.tile(x, y - 1);
+    let below = world.tile(x, y + 1);
+    if below.is_active() && is_locked_door(&below) {
+        return 2;
+    }
+    if !solid(tile.block) && !solid_top(tile.block) {
+        return 0;
+    }
+    if above.is_active() && above.block != tile.block && prevents_removal_if_on_top(above.block) {
+        if is_tree_trunk(above.block) {
+            // A trunk's own base frames may be cut out from under it; the rest may not.
+            if (above.frame_x == 66 && (0..=44).contains(&above.frame_y))
+                || (above.frame_x == 88 && (66..=110).contains(&above.frame_y))
+                || above.frame_y >= 198
+            {
+                return 0;
+            }
+            return 2;
+        }
+        if above.block == 323 {
+            if above.frame_x == 66 || above.frame_x == 220 {
+                return 2;
+            }
+            return 0;
+        }
+        return 2;
+    }
+    0
+}
+
+/// `WorldGen.KillTile` (`WorldGen.cs:64039`) as world generation reaches it.
+///
+/// The drop, dust, sound and netcode paths are skipped: `isGeneratingOrLoadingWorld` makes
+/// `noItem` true, sounds are gated on `!Main.dedServ`, and the only dust types that draw from
+/// `genRand` (583-589, 633 and 634) cannot appear in a jungle tunnel. What remains is the
+/// breakability check and the clear.
+pub fn kill_tile(world: &mut World, x: i32, y: i32) {
+    if x < 0 || y < 0 || x >= world.width() || y >= world.height() {
+        return;
+    }
+    let tile = world.tile(x, y);
+    if !tile.is_active() {
+        return;
+    }
+    if check_tile_breakability(world, x, y) == 2 {
+        return;
+    }
+    let mut tile = world.tile(x, y);
+    tile.flags.set(TileFlags::ACTIVE, false);
+    tile.flags.set(TileFlags::HALF_BRICK, false);
+    tile.frame_x = -1;
+    tile.frame_y = -1;
+    tile.color = 0;
+    tile.block = 0;
+    world.set_tile(x, y, tile);
+}
+
 /// What a [`TileRunner`] call needs from `GenVars` beyond the world and RNG.
 #[derive(Clone, Copy)]
 pub struct RunnerContext {
@@ -198,6 +362,9 @@ pub struct RunnerContext {
     /// which is the surface of the last column Terrain painted. The two differ by roughly 64 rows
     /// on a small world, and `TileRunner` reads the `Main.` one in its sand and wall branches.
     pub world_surface: f64,
+    /// `Main.rockLayer`, which the type-59 steering branch reads
+    /// (`WorldGen.cs:78039`). Not `GenVars.rockLayer`: the two differ, as with the surface.
+    pub rock_layer: f64,
     pub water_line: i32,
     /// `GenVars.lavaLine`, the depth below which a carved hole fills with lava instead of the
     /// column's usual liquid.
@@ -206,6 +373,10 @@ pub struct RunnerContext {
     /// the mud (59) runner branch reads it, so every pass ported so far sees it empty and the same
     /// either way.
     pub underground_desert: Rect,
+    /// `GenVars.mudWall`: set around the Jungle pass's mud runners, which place walls 15 and 64
+    /// in the same diamond they paint. It also skips the drunk/remix strength jitter at the top of
+    /// `TileRunner`, so it changes draws as well as tiles (`WorldGen.cs:77678`, `77781`).
+    pub mud_wall: bool,
 }
 
 impl RunnerContext {
@@ -216,10 +387,19 @@ impl RunnerContext {
     pub fn ordinary(vars: &super::passes::GenVars) -> Self {
         Self {
             world_surface: f64::from(vars.world.surface),
+            rock_layer: f64::from(vars.world.rock_layer),
             water_line: vars.water_line,
             lava_line: vars.lava_line,
             underground_desert: Rect::default(),
+            mud_wall: false,
         }
+    }
+
+    /// The same context with `GenVars.mudWall` set, which is how the Jungle pass runs its mud
+    /// runners (`JunglePass.cs:63`, `92`).
+    pub fn with_mud_wall(mut self) -> Self {
+        self.mud_wall = true;
+        self
     }
 }
 
@@ -289,13 +469,17 @@ pub fn tile_runner(
     }
 
     while num > 0.0 && num2 > 0.0 {
+        // `WorldGen.cs:77738-77741`: a mud runner stops once its centre leaves the top of the
+        // world. Without this the big 10,000-step runner keeps stepping through empty boxes.
+        if py < 0.0 && num2 > 0.0 && tile_type == 59 {
+            num2 = 0.0;
+        }
         num = strength * (num2 / f64::from(steps));
         num2 -= 1.0;
         let x0 = ((px - num * 0.5) as i32).max(1);
         let x1 = ((px + num * 0.5) as i32).min(world.width() - 1);
         let y0 = ((py - num * 0.5) as i32).max(1);
         let y1 = ((py + num * 0.5) as i32).min(world.height() - 1);
-
         for k in x0..x1 {
             // Vanilla resets the liquid kind once per column, before the row loop: a hole dug
             // within `beachDistance + 50` of either edge fills with water whatever the seed picked.
@@ -313,10 +497,37 @@ pub fn tile_runner(
                 {
                     continue;
                 }
+                let dist = (f64::from(k) - px).abs() + (f64::from(l) - py).abs();
                 let jitter = 1.0 + f64::from(next_range!(-10, 11)) * 0.015;
-                if (f64::from(k) - px).abs() + (f64::from(l) - py).abs() >= strength * 0.5 * jitter
-                {
+                if dist >= strength * 0.5 * jitter {
                     continue;
+                }
+                // `GenVars.mudWall` (`WorldGen.cs:77781-77803`). The Jungle pass's mud runners
+                // paint walls 15 and 64 into the same diamond. This branch draws three times per
+                // tile it accepts: `Next(3)`, the `0.45` distance roll, and `Next(0, 4)` when
+                // the `lavaLine` side is taken. The short-circuit order is load-bearing, so each
+                // test stays in the order vanilla wrote it.
+                if ctx.mud_wall
+                    && f64::from(l) > ctx.world_surface
+                    && world.tile(k, l - 1).wall != 2
+                    && l < world.height() - 210 - next_max!(3)
+                    && dist < strength * 0.45 * (1.0 + f64::from(next_range!(-10, 11)) * 0.01)
+                {
+                    if l > ctx.lava_line - next_range!(0, 4) - 50 {
+                        if world.tile(k, l - 1).wall != 64
+                            && world.tile(k, l + 1).wall != 64
+                            && world.tile(k - 1, l).wall != 64
+                            && world.tile(k + 1, l).wall != 64
+                        {
+                            place_wall(world, rand, &mut draws, k, l, 15);
+                        }
+                    } else if world.tile(k, l - 1).wall != 15
+                        && world.tile(k, l + 1).wall != 15
+                        && world.tile(k - 1, l).wall != 15
+                        && world.tile(k + 1, l).wall != 15
+                    {
+                        place_wall(world, rand, &mut draws, k, l, 64);
+                    }
                 }
                 let mut tile = world.tile(k, l);
                 if tile_type < 0 {
@@ -348,7 +559,7 @@ pub fn tile_runner(
                 // honey paths (368) are where this has to be finished.
                 let mut skip = false;
                 if over_ride && tile.is_active() {
-                    skip = override_skip(&tile, tile_type as u16, k, l, ctx, rand);
+                    skip = override_skip(&tile, tile_type as u16, k, l, ctx, rand, &mut draws);
                 }
                 if !skip {
                     tile.block = tile_type as u16;
@@ -437,8 +648,16 @@ pub fn tile_runner(
         } else if tile_type != 59 && num < 3.0 {
             vy = vy.clamp(-1.0, 1.0);
         }
+        // `WorldGen.cs:78029-78047`: mud runners are steered back into the rock layer. This is
+        // why the blobs keep drawing for their whole step budget instead of wandering off.
         if tile_type == 59 && !no_y_change {
             vy = vy.clamp(-0.5, 0.5);
+            if py < ctx.rock_layer + 100.0 {
+                vy = 1.0;
+            }
+            if py > f64::from(world.height() - 300) {
+                vy = -1.0;
+            }
         }
     }
 
