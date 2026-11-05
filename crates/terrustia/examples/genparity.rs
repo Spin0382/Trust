@@ -214,6 +214,34 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
         })
         .collect();
     rows.sort_by_key(|row| std::cmp::Reverse(row.0.abs()));
+    // Where, not just how many. One line per id saying which rectangle its tiles fill answers the
+    // question an aggregate cannot: whether a biome landed in the wrong place, or landed in the
+    // right place with the wrong shape.
+    for id in [396u16, 397, 53, 484, 165] {
+        let box_of = |world: &terrustia::world::World| -> Option<(i32, i32, i32, i32)> {
+            let mut found: Option<(i32, i32, i32, i32)> = None;
+            for column in 0..width {
+                for row in 0..height {
+                    let tile = world.tile(column, row);
+                    if !tile.is_active() || tile.block != id {
+                        continue;
+                    }
+                    found = Some(match found {
+                        None => (column, row, column, row),
+                        Some((x0, y0, x1, y1)) => {
+                            (x0.min(column), y0.min(row), x1.max(column), y1.max(row))
+                        }
+                    });
+                }
+            }
+            found
+        };
+        println!(
+            "  block {id:>3} box: ours {:?}, theirs {:?}",
+            box_of(ours),
+            box_of(theirs)
+        );
+    }
     println!("  active tiles by type (ours, theirs, largest gap first):");
     for (delta, t, a, b) in rows.iter().take(12) {
         println!("    type {t:>3}  ours {a:>8}  theirs {b:>8}  {delta:+}");
