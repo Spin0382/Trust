@@ -433,18 +433,23 @@ fn place_clusters(
     world_seed: u64,
 ) {
     let area = d.hive.inflated(20);
-    let field = FastRandom::new(world_seed).with_modifier(57005);
+    // One stream for the whole field, advanced once per cell: `fastRandom.Next(3)` at
+    // `DesertHive.cs:280` consumes the shared instance, so the sand-versus-hardened-sand speckle
+    // depends on every previous cell. The wall test below uses a position-modified *copy*
+    // (`WithModifier(num4, num5)`, `:373`) and therefore does not advance it.
+    let mut field = FastRandom::new(world_seed).with_modifier(57005);
     let scale = (f64::from(d.hive.width), f64::from(d.hive.height));
     let grid = (f64::from(d.columns), f64::from(d.rows));
     let half = (BLOCK_SCALE.0 / 2.0, BLOCK_SCALE.1 / 2.0);
 
-    for i in area.x..area.right() {
-        for j in area.y..area.bottom() {
+    // `.NET Rectangle.Right` and `.Bottom` are the last covered cell, not one past it, so
+    // vanilla's `i < area.Right` stops a column short of our exclusive `right()`.
+    for i in area.x..area.right() - 1 {
+        for j in area.y..area.bottom() - 1 {
             if !world.in_bounds(i, j) {
                 continue;
             }
-            let mut speckle = field;
-            let block_type = if speckle.next(3) == 0 {
+            let block_type = if field.next(3) == 0 {
                 HARDENED_SAND
             } else {
                 SAND
@@ -1378,6 +1383,61 @@ mod tests {
         let mut c = FastRandom::new(1234).with_xy(7, 9);
         let mut d = FastRandom::new(1234).with_xy(7, 9);
         assert_eq!(c.next(1000), d.next(1000));
+    }
+
+    /// The field's sand-versus-hardened-sand speckle is one `FastRandom` advanced once per cell
+    /// (`DesertHive.cs:280`). Copying the base instance inside the loop made every cell read the
+    /// same value, so the desert came out a single colour and the surface pass then hardened about
+    /// thirty thousand cells vanilla leaves as sand. Both materials must appear.
+    #[test]
+    fn the_hive_speckles_sand_and_hardened_sand_together() {
+        let mut world = sandy(1600, 900);
+        let layout = layout_for(&world);
+        let mut structures = StructureMap::new();
+        let mut rand = UnifiedRandom::new(31415);
+        scatter(&mut world, &layout, &mut structures, &mut rand, 999)
+            .expect("the desert was refused");
+        let (mut sand, mut hardened) = (0u32, 0u32);
+        for x in 300..900 {
+            for y in 120..700 {
+                let t = world.tile(x, y);
+                if !t.is_active() {
+                    continue;
+                }
+                if t.block == SAND {
+                    sand += 1;
+                } else if t.block == HARDENED_SAND {
+                    hardened += 1;
+                }
+            }
+        }
+        assert!(sand > 100, "the field wrote no sand: {sand}");
+        assert!(
+            hardened > 100,
+            "the field wrote no hardened sand: {hardened}"
+        );
+        // The share is the discriminator: a per-cell copy that restarts the stream writes one
+        // material everywhere, so the share would sit at 0 or 1.
+        let total = hardened + sand;
+        let share = f64::from(hardened) / f64::from(total);
+        assert!(
+            (0.15..=0.75).contains(&share),
+            "the field's speckle is not a mix: {share} hardened of {total}"
+        );
+    }
+
+    /// One `FastRandom` advances across calls. The field draws `Next(3)` from a single shared
+    /// instance once per cell (`DesertHive.cs:280`), so a copy that restarts each cell is not the
+    /// same stream and paints the desert in one colour.
+    #[test]
+    fn one_fast_random_advances_across_calls() {
+        let mut field = FastRandom::new(999).with_modifier(57005);
+        let first = field.next(3);
+        let rest: Vec<i32> = (0..40).map(|_| field.next(3)).collect();
+        assert!(
+            rest.iter().any(|value| *value != first),
+            "a stream that never varied would colour the whole desert identically"
+        );
     }
 
     #[test]
