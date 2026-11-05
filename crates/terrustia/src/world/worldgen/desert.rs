@@ -268,19 +268,24 @@ pub fn describe(
 
 /// `SandMound.Place` (`:7-50`): scoop the surface out and fill the bowl with sand.
 ///
-/// `.NET Rectangle.Bottom` and `.Right` are the last covered cell (`Y + Height - 1`), while this
-/// crate's `Rect::bottom()` and `Rect::right()` are one past it, so every place vanilla reads
-/// `.Bottom` this module has to subtract one. Getting that wrong shifts the whole mound by a row
-/// and changes how many column tiles get framed, which is a draw difference per tile.
+/// The rectangles are taken at face value: the game's `Rectangle.Bottom` and `.Right`
+/// (`Microsoft.Xna.Framework`, i.e. FNA) are `Y + Height` and `X + Width`, one past the last
+/// covered cell, which is the same convention as this crate's `Rect::bottom()` and `Rect::right()`.
+/// That is worth stating because the opposite reading is the natural one from `System.Drawing`, and
+/// it was tried here: treating them as inclusive moves this pass from 1,402 draws short of the
+/// reference to 3,211 short and takes the hive's wall count 1,811 cells off, while the exclusive
+/// reading lands it exactly (`wall 187: ours 105,138, theirs 105,138`).
 fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
+    // `.NET Rectangle.Bottom` in the game's own XNA-derived `Rectangle` is `Y + Height`, one past
+    // the last covered row - the same convention as this crate's `Rect::bottom()` - which is why
+    // `DesertHive.cs:266` can write `i < area.Right` and cover exactly `Width` columns, and why
+    // `HouseBuilder.cs:612` has to subtract one from `Rooms.Max(r => r.Right)`. The mound is
+    // therefore transcribed directly, with no adjustment.
     let mut bowl = d.desert;
     bowl.height = d.desert.height.min(d.hive.height / 2);
-    // `.NET Rectangle.Bottom` is the last covered row, so both rectangles are named by their
-    // inclusive bottom here rather than by this crate's exclusive `bottom()`.
-    let bowl_bottom = bowl.y + bowl.height - 1;
-    let original_bottom = d.desert.y + d.desert.height - 1;
-    let lower_span = (original_bottom - bowl_bottom).max(0);
-    let lower_bottom = bowl_bottom + lower_span - 1;
+    let mut lower = d.desert;
+    lower.y = bowl.bottom();
+    lower.height = (d.desert.bottom() - bowl.bottom()).max(0);
 
     let mut wobble_a = 0;
     let mut wobble_b = 0;
@@ -295,7 +300,7 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
         wobble_b = wobble_b.clamp(-10, 10);
 
         let curve = (1.0 - across * across * across * across).max(0.0).sqrt();
-        let floor = bowl_bottom - (curve * f64::from(bowl.height)) as i32 + wobble_a;
+        let floor = bowl.bottom() - (curve * f64::from(bowl.height)) as i32 + wobble_a;
         if across.abs() < 1.0 {
             // `Utils.UnclampedSmoothStep(0.5, 0.8, |across|)`.
             let t = (across.abs() - 0.5) / 0.3;
@@ -313,7 +318,7 @@ fn sand_mound(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
         // `PlaceSandColumn`: `height = desert2.Bottom - num5` with the inclusive bottom, and the
         // loop writes `startY + height - 1` down to `startY`, so the top row written is one above
         // `desert2.Bottom`.
-        let height = lower_bottom - floor;
+        let height = lower.bottom() - floor;
         for j in (floor..floor + height).rev() {
             if !world.in_bounds(i + d.desert.x, j) {
                 continue;
@@ -457,10 +462,10 @@ fn place_clusters(
     let grid = (f64::from(d.columns), f64::from(d.rows));
     let half = (BLOCK_SCALE.0 / 2.0, BLOCK_SCALE.1 / 2.0);
 
-    // `.NET Rectangle.Right` and `.Bottom` are the last covered cell, not one past it, so
-    // vanilla's `i < area.Right` stops a column short of our exclusive `right()`.
-    for i in area.x..area.right() - 1 {
-        for j in area.y..area.bottom() - 1 {
+    // `i < area.Right` in vanilla covers exactly `Width` columns, because the game's
+    // `Rectangle.Right` is `X + Width`; our `right()` is the same, so no adjustment here.
+    for i in area.x..area.right() {
+        for j in area.y..area.bottom() {
             if !world.in_bounds(i, j) {
                 continue;
             }
@@ -1018,18 +1023,25 @@ fn pit_entrance(world: &mut World, d: &Description, rand: &mut UnifiedRandom) {
 /// `DesertBiome.Place` (`:13-44`). Returns the area it claimed.
 ///
 /// Where the pass's 237,989 draws go, measured on the reference world by snapshotting the
-/// generator around every stage (the same breakdown is worth remeasuring if a stage changes):
+/// generator around every stage (remeasure if a stage changes):
 ///
 /// | stage | draws |
 /// |---|---|
 /// | siting, one attempt | 1 |
 /// | `describe` | 2 |
 /// | `sand_mound` | 23,339 |
-/// | entrance gate and body | 1 |
-/// | `clusters` | 29,780 |
+/// | entrance gate and body, then `clusters` | 29,781 |
 /// | `place_clusters` | 0 |
 /// | `add_tile_variance` | 22,731 |
-/// | `cleanup_area` | 160,679 |
+/// | `cleanup_area` | 160,733 |
+///
+/// Three things follow, and each one cost a wrong turn to learn. The mound's deterministic part is
+/// only 443 draws (330 columns, 113 of them taking a second roll where `i % 3 == 0`): the other
+/// 22,896 are `SquareWallFrame` per sand tile, which draw because the sand lands on ground that
+/// already has a cave wall behind it. `place_clusters` is entirely `FastRandom`
+/// (`DesertHive.cs:260`), so it cannot shift the reference stream by one number. And the entrance
+/// gate fails on this seed, so the entrance costs a single draw and nothing about
+/// `ChambersEntrance`'s 50-step spline or `Blotches` has anything to do with this pass's total.
 ///
 /// Three things follow from that table and are worth knowing before debugging it. The mound's
 /// deterministic part is only 443 draws (`desert.Width + 10` columns, of which 113 take a second
@@ -1080,11 +1092,10 @@ pub fn place(
     add_tile_variance(world, rand, &d.hive);
     cleanup_area(world, rand, &d.hive);
 
-    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20` with the
-    // inclusive `.Bottom`, so one less than this crate's exclusive `bottom()` minus 20. The
-    // recorded area is therefore taller than the desert, and every later `CanPlace` test inside it
-    // is refused for rows that have no sand in them.
-    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 21);
+    // `DesertBiome.cs:43-44`, verbatim: the height is `CombinedArea.Bottom - 20`, not that minus
+    // the `50` the rectangle starts at. The recorded area is therefore taller than the desert, and
+    // every later `CanPlace` test inside it is refused for rows that have no sand in them.
+    let area = Rect::new(d.combined.x, 50, d.combined.width, d.combined.bottom() - 20);
     structures.add_structure(area, 10);
     Some(d)
 }
@@ -1341,10 +1352,11 @@ fn add_tile_variance(world: &mut World, rand: &mut UnifiedRandom, hive: &Rect) {
 /// cannot draw during generation because their cosmetic path is guarded by `!generatingWorld`
 /// (`WorldGen.cs:82667`, `WorldUtils.cs:79-89`).
 fn cleanup_area(world: &mut World, rand: &mut UnifiedRandom, area: &Rect) {
-    // `.NET Rectangle.Right` is `X + Width - 1`, so vanilla's `i < area.Right + 20` stops one
-    // column before our exclusive `right() + 20`.
-    for i in area.x - 20..area.right() + 19 {
-        for j in area.y - 20..area.bottom() + 19 {
+    // Vanilla's `i < area.Right + 20` maps straight onto the exclusive `right() + 20`: the game's
+    // `Rectangle.Right` is `X + Width`, which is also why `DesertHive.cs:266` covers exactly
+    // `Width` columns with `i < area.Right`.
+    for i in area.x - 20..area.right() + 20 {
+        for j in area.y - 20..area.bottom() + 20 {
             if i > 0 && i < world.width() - 1 && j > 0 && j < world.height() - 1 {
                 let _ = super::tile_runner::square_wall_frame(&*world, rand, i, j);
             }
