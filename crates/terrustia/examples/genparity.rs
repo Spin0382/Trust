@@ -35,12 +35,7 @@ use terrustia::world::{
 /// pass itself can explain.
 fn draw_count(seed: i32, value: i64, limit: usize) -> Option<usize> {
     let mut rand = UnifiedRandom::new(seed);
-    for index in 0..=limit {
-        if i64::from(rand.next()) == value {
-            return Some(index);
-        }
-    }
-    None
+    (0..=limit).find(|_| i64::from(rand.next()) == value)
 }
 
 /// Print every recorded pass's draw count.
@@ -97,7 +92,7 @@ fn arg_after(flag: &str) -> Option<String> {
 /// The draw stream says whether a pass asked for the right numbers; this says whether it was
 /// looking at the right world while it asked. The surface row is what most later passes branch on
 /// - `Mount Caves` screens a 100 by 50 box around the first solid tile in its column, so a
-/// surface a few rows out silently changes how many caves get dug.
+///   surface a few rows out silently changes how many caves get dug.
 ///
 /// `theirs` is normally a vanilla world stopped at the same pass count. Comparing against the
 /// *finished* vanilla world instead is misleading: forty passes of caves, grass and trees sit on
@@ -178,7 +173,7 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
         .zip(0..i32::try_from(columns).unwrap_or(0))
         .filter(|(d, _)| *d > 0)
         .collect();
-    worst.sort_by(|a, b| b.0.cmp(&a.0));
+    worst.sort_by_key(|row| std::cmp::Reverse(row.0));
     let top: Vec<String> = worst
         .iter()
         .take(8)
@@ -218,7 +213,7 @@ fn diff_worlds(ours: &terrustia::world::World, theirs: &terrustia::world::World,
             )
         })
         .collect();
-    rows.sort_by(|a, b| b.0.abs().cmp(&a.0.abs()));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.0.abs()));
     println!("  active tiles by type (ours, theirs, largest gap first):");
     for (delta, t, a, b) in rows.iter().take(12) {
         println!("    type {t:>3}  ours {a:>8}  theirs {b:>8}  {delta:+}");
