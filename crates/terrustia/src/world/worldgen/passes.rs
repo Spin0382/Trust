@@ -319,6 +319,18 @@ pub const PASSES: &[Pass] = &[
     },
 ];
 
+/// Ports that exist and build but are not proven yet.
+///
+/// A pass joins this list the moment it is transcribed and leaves it the moment it matches the
+/// reference. `PASSES` is what the manifest gate checks, so an unfinished port can be run,
+/// measured and diffed against a stepped world without making the registry claim anything it has
+/// not earned. `run_passes` walks past `PASSES` into these when asked for a larger count, which is
+/// how `--passes 20` measures the desert while nineteen passes are proven.
+pub const PENDING: &[Pass] = &[Pass {
+    name: "Full Desert",
+    run: super::desert::run,
+}];
+
 /// Where a port stopped agreeing with a reference world.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
@@ -370,7 +382,7 @@ pub fn run_passes(
     world.crimson = crimson;
     let mut vars = GenVars::new(seed, world);
     super::reset::reset(&mut vars, Some(crimson));
-    for pass in PASSES.iter().take(count) {
+    for pass in PASSES.iter().chain(PENDING.iter()).take(count) {
         vars.rand = UnifiedRandom::new(seed);
         (pass.run)(&mut vars);
     }

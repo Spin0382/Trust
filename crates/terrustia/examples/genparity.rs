@@ -466,12 +466,23 @@ fn main() -> ExitCode {
     let diff_at = arg_after("--diff");
     if save_at.is_some() || diff_at.is_some() {
         let all = terrustia::world::worldgen::passes::PASSES;
-        // `--passes N` limits the build to the first N registered passes, which is what makes the
-        // comparison against a world stopped after pass N meaningful.
+        let proven = all.len();
+        let buildable = proven + terrustia::world::worldgen::passes::PENDING.len();
+        // `--passes N` limits the build to the first N passes, which is what makes the comparison
+        // against a world stopped after pass N meaningful. It may reach into the pending ports, so
+        // an unproven pass can be measured before it is registered; what it cannot do is make the
+        // registry claim anything.
         let count = arg_after("--passes")
             .and_then(|text| text.parse::<usize>().ok())
-            .unwrap_or(all.len())
-            .min(all.len());
+            .unwrap_or(buildable)
+            .min(buildable);
+        if count > proven {
+            println!(
+                "  note: {}/{} of these are pending ports, not registered or proven",
+                count - proven,
+                terrustia::world::worldgen::passes::PENDING.len()
+            );
+        }
         let built = terrustia::world::worldgen::passes::run_passes(
             seed,
             world.width(),
