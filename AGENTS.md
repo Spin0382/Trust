@@ -1,201 +1,291 @@
-# AGENTS.md
+# Repository Guidelines
 
-Master instructions for AI agents (and humans) working in terrustia. This is the canonical file;
-`CLAUDE.md` is a symlink to it, so Claude Code and any tool that reads `AGENTS.md` see the same
-rules. Keep it current when a convention changes.
+Canonical instructions for contributors and AI agents working in terrustia. `CLAUDE.md` is a
+symlink to this file; edit this one only.
 
-## What this project is
+## Project Overview
 
-terrustia is a Terraria 1.4.5.8 dedicated server, written from scratch in async Rust. Real Terraria
-clients connect to it, and the worlds they play are ordinary `.wld` files. The wire protocol is
-release 326 (release 325 is accepted too). The version is deliberately `0.0.1`: world generation is
-visibly unfinished and the first release should not imply otherwise by its number.
+terrustia is a Terraria 1.4.5.8 dedicated server written from scratch in async Rust. Real Terraria
+clients connect to it, and the worlds it serves are ordinary `.wld` files. The wire protocol is
+release 326 (release 325 is also accepted). The version is deliberately `0.0.1`: world generation
+is visibly unfinished, and the first release should not imply otherwise.
 
-The scope is to transcribe vanilla Terraria faithfully and be honest about the gaps. It is not a
-clone that reinvents mechanics; where behavior is defined, it is copied from the game's own shipped
-code, and where a gap exists it is disclosed rather than papered over.
+The goal is faithful transcription of vanilla behavior, not reinterpretation. Copy mechanics,
+formulas, packet shapes, and data from the game's shipped code; cite where each transcription came
+from; disclose every deliberate narrowing or gap. Do not check decompiled game source, assets, or
+text into the repository. `npc_data.rs` and `placed_items.rs` are hand-maintained exceptions with
+their own checkers.
 
-## Workspace layout
+## Architecture & Data Flow
 
-Four crates (`Cargo.toml` at the root). The default build set is three of them; the codegen tool is
-excluded so a bare `cargo build`/`cargo test` never touches it or its `regex` dependency.
+Four crates:
 
-- `crates/terrustia-proto` - the wire format, with no I/O: primitives, packets, tile-section coding,
-  and the tile/NPC/housing data tables extracted from the game. Licensed MIT on purpose, so any
-  Terraria tool in Rust can build on it. Every packet round-trips in a unit test without a socket.
-- `crates/terrustia-client` - a headless client that speaks the real protocol. It drives integration
-  tests, probes a real `TerrariaServer` for comparison, and runs as a bot.
-- `crates/terrustia` - the async server: world state, the game loop, connection handling, `.wld`
-  read/write, the console, and the optional web admin panel. AGPL-3.0-or-later.
-- `crates/terrustia-codegen` - a hand-run developer tool that regenerates the proto data tables from
-  a decompiled Terraria tree. Not part of an ordinary build.
+| Crate | Role | License |
+|---|---|---|
+| `crates/terrustia-proto` | Wire format, packet types and IDs, tile-section coding, generated data tables. No I/O. Every packet round-trips in a unit test. | MIT |
+| `crates/terrustia-client` | Headless client speaking the real protocol. Drives tests, probes real servers, runs verification bots. | AGPL-3.0-or-later |
+| `crates/terrustia` | Async server: world state, game loop, connections, `.wld` I/O, console, admin, optional web panel. | AGPL-3.0-or-later |
+| `crates/terrustia-codegen` | Hand-run table generator from a decompiled tree. Excluded from default members. | AGPL-3.0-or-later |
 
-Toolchain: edition 2024, `rust-version = 1.97`, `resolver = "3"`. `bun` is only needed to build the
-web panel frontend; the server builds and runs without it.
+Runtime model:
 
-## Everyday commands
+- Tokio multi-threaded runtime (`#[tokio::main]`), fixed 60 Hz tick (`16_666_667 ns`,
+  `game/server/tick.rs`), `MissedTickBehavior::Skip`.
+- Single-writer actor: one game task exclusively owns `GameServer` and its `World`, players, NPCs,
+  items, and projectiles. The hot path has no world lock and no interior mutability.
+- Connections send `ServerEvent` over one bounded `mpsc` (`EVENT_QUEUE = 4096`). Server-to-client
+  traffic uses a bounded per-player `mpsc<Bytes>` plus a global byte budget.
+- Events carry `(slot, epoch)`. The epoch prevents recycled connection slots from delivering ghost
+  packets. Unknown packet IDs are logged and dropped, never panicked on.
+- Not an ECS and not an actor framework. Packet dispatch is a hand-written `match` on numeric IDs;
+  packet codecs are hand-written typed functions.
+- The web panel runs in separate axum tasks and never touches world state directly. Reads go
+  through `ServerEvent` plus `oneshot` requests handled by the game task. Expensive hashing and
+  audit I/O run on blocking tasks.
+- World switching is not a hot swap: the server stops cleanly, saves, and `exec`s a replacement
+  process pointed at the new world.
 
-Recipes live in the `justfile`; each is a thin wrapper over `cargo`, so plain `cargo` works too.
+Packet path:
 
-- `just run -- --world W.wld` runs a release server (`cargo run --release -p terrustia -- ...`).
-- `just dev` builds the web panel and runs a debug server with it embedded (the local iteration loop).
-- `just build` builds the panel, then the whole release workspace.
-- `just test` runs the workspace test suite; `just test-filter NAME` narrows it and shows output.
-- `just check` runs exactly what CI runs: `cargo fmt --all --check`, `cargo clippy --workspace
-  --all-targets -- -D warnings`, `cargo clippy -p terrustia --all-targets --no-default-features`
-  (the only pass that compiles the panel's disk-serving branch and its `..`-traversal guard),
-  `cargo deny check`, the web build, and `cargo test --workspace`. Run it before you call a change
-  done. `just check-rust` is the lint pass alone, without the web build or the tests.
-- `just soak [SECONDS]` runs a real server with three real clients (the CI soak).
-- `just fuzz [TARGET] [SECONDS]` fuzzes a decoder target (needs nightly + `cargo-fuzz`).
-- `just regen` regenerates every data table from a decompiled tree (dev-only; see below).
-- `just check-data` is the qualification-time data pass, run locally and never in CI, because nine
-  of its ten parts need a decompiled tree that can never ship to a hosted runner (`check-dead-writes`
-  is the exception). It is `just fuzz`'s neighbour, not `just check`'s: run it before a release
-  candidate.
-  - `check-drops` and `check-recipes` compare the committed tables against the game's own source,
-    and `check-npc-data`, `check-placed-items` and `check-tile-object` do the same for the three
-    tables that are not plain codegen output.
-  - `check-citations` is a report, not a gate, and sits outside the `check-data` chain: it asks
-    whether the vanilla lines a citation names actually contain the numbers written beside it,
-    which is the question `check-parity` explicitly does not ask.
-  - `check-doc-citations` does for the markdown what `check-parity` does for `crates/*/src`: it
-    content-keys every Rust and vanilla line reference inside the prose (both the `path/file.rs`
-    and the `NPC.cs` forms, each with a line or a range), so a document whose code has moved
-    underneath it fails and names the line to re-read. It exists because
-    `docs/release-blockers.md` went stale twice, and the second time nothing but a person reading
-    it caught that. It never judges the sentence, only the pointer.
-  - `check-parity` re-checks every vanilla citation in `crates/*/src` against the tree. Rule 2 below
-    makes every transcription cite its source, so those thousands of `NPC.cs:12345` references are
-    data (`just check-parity` prints the current count; hard-coding one here only ages);
-    `docs/parity-index.tsv` is derived from them and keys each one by a hash of the cited vanilla
-    lines and a hash of our own item's body, so a "checked against the game" claim expires on its
-    own and the failure says which side moved. It never judges whether a transcription is *correct*.
-    `just parity-coverage` is the other half: what fraction of each vanilla file anything we wrote
-    cites, and which large regions are cited by nothing. Rebuild the index with `just parity-update`
-    and review the diff, exactly as with the generated tables.
-  - `check-spawn-reach` diffs every NPC vanilla's own `NPC.Spawner` can spawn ambiently against
-    every NPC this server can, and reports the ones nobody playing here could ever meet. An
-    unreachable NPC is silent: nothing errors and no test fails, which is how the whole sky roster
-    (the Harpy and the Wyvern) sat in no pool at all. Vanilla's side is read from the tree; ours is
-    read from the server by running the one test that prints it. The known gaps live in
-    `docs/spawn-gaps.tsv`, rebuilt with `just spawn-reach-update` and reviewed as a diff.
-  - `check-dead-writes` reports struct fields written in production and read only by the tests.
-    `rustc`'s `dead_code` cannot see these, because a read inside `#[cfg(test)]` counts as a read;
-    that blind spot is how thirteen boss-enrage sites wrote `Npc::damage_bonus` that nothing read.
-    Needs no decompiled tree.
-  - `check-mutants` corrupts the committed tables one entry at a time and requires the checkers
-    above to fail. A mutant that survives is a checker blind spot by definition, which is how a
-    missing drop stays missing; `--rust` additionally measures the proto test suite, slowly.
+```text
+TCP bytes
+  -> net/codec.rs: [u16 len][u8 id][payload]
+  -> net/connection.rs read_loop
+  -> ServerEvent::Packet { slot, epoch, frame }
+  -> game/server/mod.rs handle_event (epoch checked)
+  -> game/server/dispatch.rs handle_packet: match frame.id
+  -> on_* handler validates and mutates world/player/NPC state
+  -> send_bytes / broadcast
+  -> per-player mpsc<Bytes> -> write_loop -> TCP
+```
 
-## How to work here (non-negotiables)
+Tick phases are ordered: clock and events, snapshot drain and autosave, auth/save completion,
+liquids, growth and spread, weather, tile entities and mechanisms, dirty sections and streaming,
+items, NPC/buff processing, projectiles, contact damage, spawning, housing. Keep new logic in the
+appropriate phase rather than inventing a parallel loop.
 
-These are the conventions that matter most in this codebase, drawn from how it has actually been
-built.
+World I/O:
 
-1. **Investigate first; trace to root cause; verify, do not assume.** This is the project's spine.
-   Before changing a system, read vanilla's real shipped source for it and understand the actual
-   mechanism. "Audit" here means tracing behavior to its root cause in real code (both the game's and
-   this repo's), never summarizing CI or test status. When a result is ambiguous, a test fails in a
-   way that is easy to wave off as noise, or a finding would rest on "probably" instead of "verified",
-   dig in and check. Investigate before committing. A fix is not done until you understand why the
-   bug happened.
+- Load with `world/wld.rs`; save with `world/wld_save.rs` through a temp file and atomic rename.
+- Loaded worlds preserve and patch their existing header byte-for-byte where possible. Generated
+  worlds are written at protocol 326.
+- Autosave drains an incremental world snapshot over multiple ticks, then writes on
+  `spawn_blocking`. Shutdown saves synchronously.
+- World generation lives in `crates/terrustia/src/world/worldgen/`. It targets complete, playable
+  worlds; seed-identical vanilla parity is tracked separately in `docs/worldgen-parity.md`.
 
-2. **Transcribe vanilla, and cite where from.** When you copy a table, a formula, or an AI routine
-   from the decompiled game, note the source location in a comment (for example `WorldGen.cs`
-   line ranges, or a method name). Disclose every deliberate narrowing or reordering. No decompiled
-   game source, game assets, or game text is checked into this repository. The one documented
-   exception is the town-NPC name pools in `town_names.rs`, whose provenance is recorded in
-   `docs/generated-tables.md`.
+## Key Directories
 
-3. **Hand-roll narrow, well-defined things; stability over build time.** This workspace hand-rolls
-   the game's wire format, TOML-shaped needs, terminal line editing, UPnP IGD port-mapping
-   (`upnp.rs`), and similar narrow protocols on purpose. A dependency is taken only where
-   hand-rolling would be worse: password hashing (`argon2`), a secure temp directory (`tempfile`),
-   config and admin-store TOML (`toml`), logging (`tracing`/`tracing-subscriber`), portable
-   raw-mode/key decoding (`crossterm`), the panel's HTTP/WebSocket surface (`axum`), embedding the
-   panel (`rust-embed`), the one update HTTP client (`ureq`), and deflate (`flate2` with the
-   `zlib-rs` backend).
-   Each of those choices is justified in a comment in the root `Cargo.toml`; read it before touching
-   dependencies. Do not rewrite a working, already-verified subsystem to shave crates: a mature
-   dependency is worth more than the crates it costs, and rewriting resets verification that has been
-   earned. The full trade is in `TODO.md` under "Dependency pruning".
+| Path | Purpose |
+|---|---|
+| `crates/terrustia/src/main.rs` | Binary entry point, CLI, config layering, boot orchestration, stop and relaunch |
+| `crates/terrustia/src/game/server/` | `GameServer`, event handling, dispatch, tick loop, systems, console, panel bridge |
+| `crates/terrustia/src/game/` | Player, NPC, AI transcriptions, projectiles, events, spawning |
+| `crates/terrustia/src/net/` | Framing, accept loop, per-connection tasks, traffic recording |
+| `crates/terrustia/src/world/` | Authoritative world, tile store, `.wld` read/write, worldgen |
+| `crates/terrustia/src/panel/`, `admin/` | Admin HTTP/WebSocket panel, accounts, permissions, bans, audit |
+| `crates/terrustia/src/config.rs` | TOML config, environment overrides, validation |
+| `crates/terrustia-proto/src/` | `id.rs`, `packets/`, `reader.rs`, `writer.rs`, `section.rs`, data tables |
+| `crates/terrustia-client/src/` | Client handshake, actions, local world view, capture files |
+| `crates/terrustia/tests/` | Out-of-process and in-process integration tests |
+| `crates/terrustia/web-panel/` | Svelte 5 + TypeScript + Vite admin UI, built with bun |
+| `docs/` | Protocol, world file, performance, parity, release-blocker references |
+| `tools/` | Python checkers and shell verification scripts |
+| `fuzz/` | Standalone `cargo-fuzz` workspace |
 
-4. **Prefer explicit code over derive-heavy convenience.** Routes are built by hand rather than with
-   `axum` macros; this is a deliberate house style, not an oversight.
+## Development Commands
 
-5. **Warnings are errors.** The workspace sets `warnings = "deny"` and clippy `all = "deny"`
-   (deliberately not `pedantic`, which would push transcribed code away from the game's shape).
-   `unsafe_code` is warned, not forbidden, because one crate needs a single `unsafe` block for the
-   CPU clock (`game/clock.rs`); the other two crates forbid unsafe at their roots. A dead-code or
-   unused-import warning breaks the build, which is a useful forcing function when refactoring.
-   Finish with `cargo fmt --all` and a clean `just check`.
+Toolchain: Rust 1.97.1 (pinned by `rust-toolchain.toml`), edition 2024, resolver 3. Use `just` for
+recipes; each wraps `cargo`.
 
-6. **Do not panic on the packet path.** The server catches panics with `std::panic::catch_unwind`
-   (`net/listener.rs`, `game/server.rs`) to save the world and exit non-zero so `Restart=on-failure`
-   fires; `panic = "unwind"` in the release profile must stay for that to work. Production error
-   handling should degrade gracefully (for example, an autosave that cannot write warns and retries;
-   it does not take the process down). The ongoing effort to remove non-test `.unwrap()`/`.expect()`/
-   `panic!` from production paths is tracked in `TODO.md`; `#[cfg(test)]` panics are out of scope.
+| Command | Effect |
+|---|---|
+| `just install` | Fetch Rust deps and install panel deps if bun exists |
+| `just run -- --world W.wld` | Release server (`cargo run --release -p terrustia`) |
+| `just dev` | Build panel, then debug server with `--features embed-web` |
+| `just web` | Vite panel dev server with hot reload (bun) |
+| `just build` | Build panel, then the release workspace |
+| `just check` | CI-equivalent: fmt, clippy (default and no-default-features), cargo-deny, packet audit, web build, tests |
+| `just check-rust` | Lint and supply-chain passes without web or tests |
+| `just test` | `cargo test --workspace` |
+| `just test-filter NAME` | Filtered workspace tests with `--nocapture` |
+| `just check-panel` | Release binary plus Playwright Chromium panel spec |
+| `just soak [SECONDS]` | Real server plus three real clients (`tools/soak_ci.sh`) |
+| `just fuzz [TARGET] [SECONDS]` | Fuzz `packet_decoders` or `section_stream` (nightly + cargo-fuzz) |
+| `just regen` | Regenerate all data tables from `.scratch/decompiled` |
+| `just check-data` | Local-only data, parity, citation, reachability, and mutation checks |
+| `just roundtrip FILE OUT` | Byte-level `.wld` round-trip check |
+| `just conform ADDR CAPTURE` | Re-encode a real server's captured bytes |
+| `just docker-build` | Build the container image (expects a prebuilt binary) |
 
-7. **Generated data tables are codegen output. Never hand-edit them.** These files are produced by
-   `just regen` from a decompiled tree and are checked in only so an ordinary build needs nothing but
-   Rust: `recipes.rs`, `npc_drops.rs`, `projectile_data.rs`, `banners.rs`, `buffs.rs`, `angler.rs`,
-   `shimmer.rs`, `hurt_tiles.rs`, `town_names.rs`, `travel_shop.rs`, `tile_death.rs`,
-   `net_variants.rs`, `golf_physics.rs`, `tile_object.rs` (all in `terrustia-proto/src`).
-   `golf_physics.rs` was missing from this list until 2026-09-06 while carrying "Do not edit by
-   hand" in its own header, which is the one way a generated file gets hand-edited by someone
-   following the rules.
-   To change one, change the generator and rerun `just regen`, then review the diff before committing.
-   Their size is fine; they are excluded from the file-splitting refactor in `TODO.md`.
-   `tile_object.rs` is the odd one: its generator emits the file's hand-written half (the struct,
-   `frame_of`, `style_of`, `origin_of` and the tests) as string constants, because the table and the
-   arithmetic that reads it belong in one module. Edit those in
-   `crates/terrustia-codegen/src/tile_object.rs`, not in the output.
-   Two tables are *not* generated and say so in their own headers: `npc_data.rs` and
-   `placed_items.rs`. They are corrected in place with a citation, and held to source by
-   `just check-npc-data` and `just check-placed-items` instead.
+Examples:
 
-## File editing and commits
+```sh
+cargo test -p terrustia --test gameplay
+cargo test -p terrustia --test gameplay a_chest_can_be_opened -- --nocapture
+cargo run --release -p terrustia-client --example verify -- 127.0.0.1:7777
+cargo run --release -p terrustia --example probe -- --help
+```
 
-These apply to every agent, tool-agnostically.
+## Code Conventions & Common Patterns
 
-- **Edit files with a real editor, not the shell.** No `sed -i`, no heredoc redirects, no `>`/`>>`
-  into source, no inline `python -c`/scripts that rewrite files. A generator script that produces
-  checked-in source is fine to run, but write the script itself with an editor.
-- **No em dashes.** Not in prose, docs, comments, or commit messages. Use hyphens, colons,
-  parentheses, or separate sentences. (Legacy em dashes still exist throughout the repo; removing
-  them is a separate low-priority sweep noted in `TODO.md`, but do not add new ones.)
-- **Never add `Co-Authored-By`, or any co-author trailer, to a commit.** Ever.
-- **Commit or push only when asked.** If you are on the default branch, branch first. Keep commit
-  messages factual and scoped.
+### Compilation and errors
 
-## Verifying against the real game
+- Workspace lints deny all warnings; clippy `all` is denied, pedantic is intentionally not enabled
+  because it fights transcribed code shapes. A dead import or unused variable fails the build.
+- Errors use per-module `thiserror` enums with a local `type Result<T>`. There is no `anyhow`.
+  `main` may use `Box<dyn std::error::Error>` for CLI orchestration.
+- Production paths must not panic. Runtime failures degrade gracefully; autosave failures warn and
+  retry. The server catches panics on the packet path only to save the world and exit non-zero, so
+  release keeps `panic = "unwind"`.
+- Never introduce `.unwrap()`, `.expect()`, or `panic!` outside `#[cfg(test)]` without a strong
+  invariant and a comment. `tests/panic_budget.rs` encodes the allowed production panic count.
 
-Correctness here is proven against Terraria itself, not only against our own code. The examples are
-the tools, and they are split across both crates, so each needs its `-p`: in `terrustia-client`,
-`conform` re-encodes a real server's own bytes and `verify` joins, spawns things, and confirms
-enemies move, shoot, hurt and drop loot, while `load` and `soak` hold a world open and `playthrough`
-walks the loot spine boss by boss to the Moon Lord. In `terrustia`, `probe` dumps and compares the
-packet sequence against a real `TerrariaServer`, `roundtrip_wld` checks `.wld` round-trips at the
-byte level, `stress`/`crowd` hold a full world while the server reports per-phase tick costs,
-`bestiary` walks all 691 NPC types over the wire, and `fuzz` throws malformed packets at a running
-server. The web panel is verified in a real browser with
-Playwright (`just check-panel`): the spec starts the shipped release binary with the panel
-embedded and drives it in Chromium, so a break in the embedding, the routes, the auth gate or the
-JSON shape fails there rather than in a review. That sentence was in this file long before any of
-it existed - no dependency, no config, no spec - which is why the recipe is named here. When you fix a bug, add a test that fails against the bug first, then passes.
+### Naming and module layout
 
-## Where to look
+- Handlers: `on_<packet>`; per-tick systems: `tick_<system>`; recorders: `record_*`; notes:
+  `note_*`.
+- Coordinator modules (`game/server/mod.rs`, `panel/mod.rs`) own shared types and wire together
+  sibling files split by resource. Add a sibling module instead of growing a giant file.
+- Prefer explicit code over derive-heavy convenience. Axum routes are built by hand, not with
+  macros. Narrow protocols and formats are hand-rolled when a dependency would be worse.
+- Keep behavioral constants in the module that uses them. Add a comment naming the vanilla source.
 
-- `README.md` - the feature-by-feature status, the audit findings worth telling, and the layout.
-- `CONTRIBUTING.md` - the bar a change is held to and the contributor license terms.
-- `AUDIT.md` / `SECURITY.md` - the audit trail and the security posture.
-- `TODO.md` - the single backlog and the v0.0.1 roadmap: lanes, gates, deferred work, and the
-  dependency-pruning record. The former `plan.md` and `GAPS.md` are folded into it; their full
-  text lives in git history.
-- `docs/release-blockers.md` - what is *not* done for v0.0.1: the release bar clause by clause with
-  the evidence for each, the known bugs left in on purpose, and the backlog entries that were found
-  claiming things the code contradicted. Read it before answering "is this ready", because that
-  question has been answered too generously from memory before.
-- `docs/` - protocol notes, world-file notes, performance method, and the generated-table provenance.
+### Vanilla citations
+
+Every copied formula, table entry, AI routine, or packet behavior cites the decompiled source, for
+example `Main.cs:6342` or `WorldGen.cs` line ranges. State any deliberate change from vanilla in
+the same comment. `just check-parity` content-keys Rust citations; `just check-doc-citations` does
+the same for Markdown. After moving code or editing cited docs, rebuild the relevant index with
+`just parity-update` or `just doc-citations-update` and review the diff.
+
+### Generated data
+
+Never hand-edit codegen output. The generated files are `recipes.rs`, `npc_drops.rs`,
+`projectile_data.rs`, `banners.rs`, `buffs.rs`, `angler.rs`, `shimmer.rs`, `hurt_tiles.rs`,
+`town_names.rs`, `travel_shop.rs`, `tile_death.rs`, `net_variants.rs`, `golf_physics.rs`, and
+`tile_object.rs`, all under `crates/terrustia-proto/src/`. Change the generator and run
+`just regen`, then review the diff. `tile_object.rs` also emits its hand-written struct and
+functions from `crates/terrustia-codegen/src/tile_object.rs`; edit there, not in the output.
+
+`npc_data.rs` and `placed_items.rs` are not generated. Correct them in place with a citation and
+run `just check-npc-data` / `just check-placed-items`. Regression assertions that must survive
+regeneration belong in `crates/terrustia-proto/tests/generated_tables.rs`.
+
+### Dependencies
+
+Hand-roll narrow, well-defined protocols. Take a dependency only when hand-rolling would be worse:
+`argon2` (password hashing), `tempfile` (secure temp directory), `toml`, `tracing`,
+`crossterm`, `axum`, `rust-embed`, `ureq`, and `flate2` with `zlib-rs`. Rationale for each is in
+the root `Cargo.toml`; read it before adding or removing a dependency. Do not rewrite a verified
+subsystem to shave crates.
+
+### Editing and commits
+
+- Edit files with a real editor. No `sed -i`, heredoc redirects, `>`/`>>` into source, or inline
+  scripts that rewrite source. Generator scripts that produce checked-in source are fine.
+- No em dashes in prose, docs, comments, or commit messages. Use hyphens, colons, parentheses, or
+  separate sentences.
+- Never add `Co-Authored-By` or any co-author trailer.
+- Commit or push only when asked. If on the default branch, branch first. Keep messages factual
+  and scoped.
+- Bug fixes should start with a test that fails against the bug. Do not pin incidental behavior or
+  implementation details in permanent tests.
+
+## Important Files
+
+| File | Why it matters |
+|---|---|
+| `crates/terrustia/src/main.rs` | CLI, config precedence, boot, task supervision, graceful stop |
+| `crates/terrustia/src/game/server/mod.rs` | `GameServer` state, event loop integration, save, broadcast |
+| `crates/terrustia/src/game/server/tick.rs` | Tick interval and phase order |
+| `crates/terrustia/src/game/server/dispatch.rs` | Incoming packet `match` and handlers |
+| `crates/terrustia/src/game/server/systems.rs` | Per-tick simulation systems |
+| `crates/terrustia/src/net/listener.rs`, `net/connection.rs` | Accept limits and per-connection framing |
+| `crates/terrustia/src/world/wld.rs`, `world/wld_save.rs` | World load and atomic save |
+| `crates/terrustia/src/config.rs` | Config schema, env overrides, validation |
+| `crates/terrustia-proto/src/id.rs`, `packets/`, `section.rs` | Packet IDs, typed codecs, tile sections |
+| `crates/terrustia-client/src/lib.rs` | Client handshake and actions |
+| `crates/terrustia/tests/support/mod.rs` | Test harness: free ports, scratch dirs, child reaper |
+| `crates/terrustia/web-panel/tests/panel.spec.ts` | End-to-end panel verification |
+| `justfile` | Canonical commands and data-check chain |
+| `Cargo.toml` | Workspace policy, lints, dependency rationale, profiles |
+| `terrustia.toml.example` | Documented config surface |
+| `docs/generated-tables.md` | Table provenance and regeneration |
+| `docs/release-blockers.md` | What is not done for v0.0.1; read before claiming readiness |
+| `TODO.md` | Single backlog and roadmap |
+
+## Runtime/Tooling Preferences
+
+- Use the pinned Rust 1.97.1 toolchain. Do not change `rust-toolchain.toml` casually.
+- `just` is the task runner. `cargo` works directly for individual commands.
+- Web panel: `bun` only, no Node/npm. Build output is `crates/terrustia/web-panel/dist` and is
+  embedded by `rust-embed` when the `embed-web` feature (default on) is enabled. Without that
+  feature the panel is served from disk; this mode must still compile.
+- Python 3 runs the packet audit and data checkers. `cargo-deny` checks licenses and bans. Fuzzing
+  needs nightly and `cargo-fuzz`. Panel checks need Playwright Chromium. `cosign` is needed only
+  for update tests and release verification.
+- Configuration precedence is defaults < `terrustia.toml` < `TERRUSTIA_*` environment variables <
+  explicit CLI flags. The config file defaults to `terrustia.toml` in the working directory; a
+  missing file is valid. Every config field has an environment variable (see `config.rs`).
+- Worlds live in a `worlds/` directory in the working directory unless `--world` or `--save`
+  overrides. Admin state is `<save>.admin.toml`; audit and console history sit beside the world.
+- The panel binds loopback only and is disabled by default. Do not weaken that validation.
+- Docker images expect a prebuilt musl binary and run as a non-root user with `/data` as the
+  volume; packaging manifests live under `packaging/`.
+
+## Testing & QA
+
+Test layers:
+
+- Inline unit tests live in `#[cfg(test)] mod tests` beside the code they cover.
+- Integration tests under `crates/terrustia/tests/` either run `GameServer` in process on an
+  ephemeral port or spawn the compiled binary via `CARGO_BIN_EXE_terrustia` when process behavior
+  matters (CLI, signals, restart, 255-player burst).
+- `crates/terrustia-proto/tests/generated_tables.rs` holds regression tests for generated data.
+- `crates/terrustia/tests/support/mod.rs` provides `free_port`, collision-safe scratch dirs, and
+  `Reaper` for child processes. Use it instead of hard-coded ports or raw children.
+- `fuzz/` is a separate workspace with `packet_decoders` and `section_stream` targets.
+- Real-client verification tools are examples: `terrustia-client`'s `conform`, `verify`, `load`,
+  `soak`, and `playthrough`; `terrustia`'s `probe`, `bestiary`, `stress`, `crowd`, `fuzz`, and
+  `roundtrip_wld`. `conform` re-encodes a real server's own bytes and is the strongest check that
+  encoder and decoder are not sharing the same misreading.
+
+Commands:
+
+```sh
+just check                         # full local gate
+just test                          # workspace tests
+just test-filter gameplay          # filtered, with output
+just check-panel                   # Playwright against the embedded release binary
+just soak 60                       # real server and three clients
+just fuzz section_stream 60        # nightly required
+just check-data                    # needs .scratch/decompiled; local only
+```
+
+QA gates:
+
+- `just check` runs `cargo fmt --all --check`, workspace clippy, clippy with
+  `-p terrustia --no-default-features` (the disk-serving panel branch), `cargo deny check`,
+  `tools/packet_audit.py`, the web build, and the workspace test suite.
+- CI adds cross-target `cargo check`, host-native tests under `--no-default-features`, cargo-deny,
+  packet audit, 60-second fuzz runs, and the 60-second soak.
+- CI does not run `check-data`, parity, citation, or generated-table content checks because they
+  need a decompiled tree. Run those locally before a release candidate.
+- Run `cargo fmt --all` and `just check` before calling a change done.
+
+Expectations and gotchas:
+
+- Tests must be deterministic and isolated. Seed generation explicitly and prepare the tiles a
+  test needs rather than depending on generated terrain.
+- Use `support::free_port`; avoid fixed ports. `new_world_cli.rs` serializes generator-heavy tests
+  with a mutex. `queue_capacity.rs` and the Playwright spec use fixed ports by design.
+- `embed-web` is enabled by default. Panel tests require `web-panel/dist` to be built; without it,
+  `build.rs` supplies an empty fallback and assertions fail.
+- Unix-only tests (`world_switch`, signal handling) and Windows-only tests (`update_apply`) are
+  marked at file level.
+- Cosign-dependent update tests skip when `cosign` is absent or the transparency log is
+  unreachable. Long-running helpers are `#[ignore]` and not part of the default suite.
+- Use `TERRUSTIA_LOG` for diagnostics. Test-specific variables include `TERRUSTIA_TEST_WLD`,
+  `TERRUSTIA_UPDATE_CHECK_ENABLED=false`, and `TERRUSTIA_UPNP_ENABLED=false`; filesystem tests
+  redirect `HOME`, `XDG_DATA_HOME`, or `USERPROFILE`.
