@@ -123,6 +123,11 @@ tempfile = "3"
 
 [profile.dev]
 opt-level = 1
+# Full DWARF is the largest single thing in `target` on a small disk, and the dev build is never
+# the artifact anybody ships: release strips symbols. Line tables keep a panic backtrace at
+# file:line, which is all the test suite and the soak assertions actually read. It applies to the
+# optimised dependencies below as well, because package profiles inherit this one.
+debug = "line-tables-only"
 
 # World generation and tile-section deflate are hot even in debug builds; keeping
 # dependencies optimised makes a debug server usable against a real client.
